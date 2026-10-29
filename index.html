@@ -1,16 +1,9 @@
 <!doctype html>
 <html lang="en">
-<!--
-THESIS: An instrument panel for tracing JSON into relationships, not a dashboard of cards.
-OWN-WORLD: Cool white panels, slate rules, cobalt actions, system UI and code typography.
-STORY: Edit a document, locate a fault, then inspect the exact relationship it describes.
-FIRST VIEWPORT: Source left, graph center, inspector right; diagnostics directly below source.
-FORM: Instrument-panel workspace, candidate 5, seed ca3e9e67; persistent three-pane staging.
--->
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="light dark">
   <title>jg — JSON Graph workbench</title>
   <link rel="stylesheet" href="./styles.css">
   <script type="module" src="./app.js"></script>
@@ -21,21 +14,37 @@ FORM: Instrument-panel workspace, candidate 5, seed ca3e9e67; persistent three-p
     <div class="file-actions">
       <span class="local-note"><span class="local-dot"></span> Local to your browser</span>
       <button id="example" type="button">Load example</button>
+      <button id="open-url" type="button" aria-expanded="false" aria-controls="url-form">Load from URL</button>
       <button id="open" class="primary" type="button">Open JSON file</button>
       <input id="file" type="file" accept=".json,.jsonld,application/json" hidden>
     </div>
   </header>
+  <form id="url-form" class="url-form" hidden>
+    <label for="url-input">Document URL</label>
+    <input id="url-input" type="url" inputmode="url" placeholder="https://raw.githubusercontent.com/…/graph.json" autocomplete="url" spellcheck="false" required>
+    <button id="url-submit" class="primary" type="submit">Load</button>
+    <button id="url-cancel" type="button">Cancel</button>
+    <p id="url-message" class="url-message">Fetched directly by your browser. The server must allow cross-origin requests (CORS). GitHub file links are converted to raw URLs.</p>
+  </form>
   <main class="workspace">
-    <section class="source-pane" aria-labelledby="source-heading">
+    <section id="source-pane" class="source-pane" aria-labelledby="source-heading">
       <div class="pane-heading"><h2 id="source-heading">Document</h2><span class="version">JSON Graph v2.1</span></div>
       <div class="source-toolbar"><span id="filename" title="example.json">example.json</span><div><button id="format" type="button" title="Format JSON (Ctrl or Command + Shift + F)">Format</button><button id="download" type="button">Save JSON</button></div></div>
-      <div class="editor-wrap">
-        <div id="line-numbers" aria-hidden="true">1</div>
-        <textarea id="source" aria-label="JSON Graph document" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea>
-      </div>
-      <div class="editor-footer"><span id="cursor">Ln 1, Col 1</span><span>Live preview <kbd>Ctrl</kbd> <kbd>Enter</kbd></span></div>
-      <section class="diagnostics" aria-labelledby="diagnostics-heading">
-        <div class="pane-heading"><h2 id="diagnostics-heading">Diagnostics</h2><span id="diagnostic-count">Checking…</span></div>
+      <div id="editor" class="editor-wrap"></div>
+      <div class="editor-footer"><span id="cursor">Ln 1, Col 1</span><span>Saved in this browser · Check now <kbd>Ctrl</kbd> <kbd>Enter</kbd></span></div>
+      <section id="diagnostics-panel" class="diagnostics" aria-labelledby="diagnostics-heading">
+        <div class="pane-heading"><h2 id="diagnostics-heading">Diagnostics</h2><span id="diagnostic-count">Checking…</span><button id="expand-diagnostics" type="button" aria-pressed="false" title="Give diagnostics more room">Expand</button></div>
+        <div id="diagnostic-summary" class="diagnostic-summary"></div>
+        <div class="diagnostic-toolbar">
+          <div class="filters" role="group" aria-label="Filter by severity">
+            <button type="button" data-filter="all" aria-pressed="true">All <span></span></button>
+            <button type="button" data-filter="error" aria-pressed="false">Errors <span></span></button>
+            <button type="button" data-filter="warning" aria-pressed="false">Warnings <span></span></button>
+            <button type="button" data-filter="info" aria-pressed="false">Info <span></span></button>
+          </div>
+          <label class="checkbox"><input id="diagnostic-details" type="checkbox" checked> Details</label>
+          <button id="copy-report" type="button">Copy report</button>
+        </div>
         <div id="diagnostics" aria-live="polite"></div>
       </section>
     </section>
@@ -43,7 +52,7 @@ FORM: Instrument-panel workspace, candidate 5, seed ca3e9e67; persistent three-p
     <section class="preview-pane" aria-labelledby="preview-heading">
       <div class="pane-heading preview-heading">
         <h2 id="preview-heading">Graph preview</h2>
-        <span id="engine-status" class="engine-status">Starting WASM…</span>
+        <span id="engine-status" class="engine-status">Graphviz WASM · loads on first preview</span>
       </div>
       <div class="preview-toolbar">
         <label class="sr-only" for="graph-select">Graph</label>
@@ -63,7 +72,7 @@ FORM: Instrument-panel workspace, candidate 5, seed ca3e9e67; persistent three-p
           <button id="fit" type="button">Fit</button>
         </div>
       </div>
-      <div class="preview-footer"><span>Drag background to pan · Scroll to zoom</span><button id="retry-engine" type="button" hidden>Retry engine</button><button id="export" type="button" disabled>Export SVG</button></div>
+      <div class="preview-footer"><span>Drag to pan · Scroll to zoom · Double-click to edit</span><button id="retry-engine" type="button" hidden>Retry engine</button><span class="export-group" role="group" aria-label="Export"><button id="export-svg" type="button" disabled>SVG</button><button id="export-png" type="button" disabled>PNG</button><button id="export-dot" type="button" disabled title="Graphviz DOT source">DOT</button></span></div>
     </section>
 
     <aside class="inspector-pane" aria-labelledby="inspector-heading">
@@ -71,9 +80,10 @@ FORM: Instrument-panel workspace, candidate 5, seed ca3e9e67; persistent three-p
       <div class="search-wrap"><label for="search">Find a node</label><input id="search" type="search" placeholder="Search ID or label…" autocomplete="off"></div>
       <div id="search-results" class="search-results" hidden></div>
       <div id="inspector" class="inspector"></div>
-      <div class="inspector-help"><h3>A direct line to your source</h3><p>Select a node or edge to inspect its data. Diagnostics point to the exact field that needs attention.</p><a href="https://github.com/jsongraph/json-graph-specification" target="_blank" rel="noreferrer">JSON Graph specification ↗</a></div>
+      <div class="inspector-help"><h3>A direct line to your source</h3><p>Select a node or edge to highlight its source; move the cursor in the source to select it here. Diagnostics point to the exact field and offer quick fixes.</p><a href="https://github.com/jsongraph/json-graph-specification" target="_blank" rel="noreferrer">JSON Graph specification ↗</a></div>
     </aside>
   </main>
-  <footer class="app-footer"><span id="status" role="status">Initializing…</span><span>No uploads. No remote rendering.</span></footer>
+  <div id="drop-zone" class="drop-zone" hidden><p>Drop a JSON file or link to open it</p></div>
+  <footer class="app-footer"><span id="status" role="status">Initializing…</span><span>No uploads. Graphs render locally with Graphviz WASM.</span><span id="deployed" hidden></span></footer>
 </body>
 </html>

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jg-site
+          path: dist
+          retention-days: 14
+      - name: How to preview
+        run: |
+          {
+            echo "### Preview this build"
+            echo "Download the **jg-site** artifact, unzip it, then serve it locally:"
+            echo '```sh'
+            echo 'npx serve jg-site   # or: python3 -m http.server -d jg-site'
+            echo '```'
+            echo "Or check out this branch and run \`npm ci && npm start\`, then open http://localhost:8000/jg/."
+          } >> "$GITHUB_STEP_SUMMARY"

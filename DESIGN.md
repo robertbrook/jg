@@ -2,7 +2,7 @@
 
 The page is an Operate surface: a light instrument panel for moving between source, relationships, and diagnostics. Users work with dense data in ordinary ambient light; white panels and a pale blue-gray canvas preserve code and graph legibility.
 
-Use the system UI font for controls, headings, and explanations; use system monospace only for JSON, IDs, paths, and measurements. Primary text is slate `#233346`, secondary text `#59697a`, rules `#d6dee7`, and actions/selection cobalt `#2058b8`. Errors are dark red, warnings dark ochre, successful validation dark green. Graphviz labels use Arial to keep generated SVG portable.
+Keep styling simple and native: `system-ui` for all text, system monospace only for JSON and code, unstyled native controls, and a small set of `light-dark()` colour variables so the page follows the system light or dark theme. Errors are red, warnings ochre, and successful validation green. Graphviz labels use Helvetica, one of the fonts Graphviz has metrics for.
 
 Desktop maintains source, preview, and inspector columns with persistent toolbars. At intermediate widths, the inspector moves below the editing panes; mobile stacks all three in task order. Avoid decorative cards: thin rules separate functional regions. Small rounded corners belong to controls and the outer workspace.
 
