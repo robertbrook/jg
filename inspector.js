@@ -1,4 +1,4 @@
-import { graphStats, pointer } from "./graph.js";
+import { attributeEntries, graphStats, pointer } from "./graph.js";
 import { element, button, plural } from "./ui.js";
 
 const MAX_OUTLINE = 300;
@@ -61,11 +61,44 @@ function changes(diff) {
   return box;
 }
 
+// Every attribute of the selected item, each with a toggle that shows it in the diagram's labels.
+function attributeTable(entries, kind, shown, onToggle) {
+  const table = element("table", undefined, "attributes");
+  table.append(element("caption", "Attributes"));
+  const head = element("tr");
+  head.append(element("th", "Attribute"), element("th", "Value"), element("th", "Show"));
+  const headRow = element("thead");
+  headRow.append(head);
+  const body = element("tbody");
+  for (const [path, value] of entries) {
+    const row = element("tr");
+    const name = element("th", path);
+    name.scope = "row";
+    const cell = element("td");
+    if (typeof value === "string" && /^https?:\/\//.test(value)) {
+      const link = element("a", value);
+      link.href = value; link.target = "_blank"; link.rel = "noreferrer noopener";
+      cell.append(link);
+    } else cell.textContent = typeof value === "string" ? value : JSON.stringify(value);
+    const toggle = element("input");
+    toggle.type = "checkbox";
+    toggle.checked = shown.includes(path);
+    toggle.setAttribute("aria-label", `Show ${path} in the diagram`);
+    toggle.addEventListener("change", () => onToggle(kind, path, toggle.checked));
+    const control = element("td");
+    control.append(toggle);
+    row.append(name, cell, control);
+    body.append(row);
+  }
+  table.append(headRow, body);
+  return table;
+}
+
 /**
  * @param {HTMLElement} panel
- * @param {{ entry?: { graph, path }, index: number, selection, diff, onSelect(kind, id): void, onReveal(kind, id): void, onJump(path): void }} state
+ * @param {{ entry?: { graph, path }, index: number, selection, diff, shown: { node: string[], edge: string[] }, onSelect(kind, id): void, onReveal(kind, id): void, onJump(path): void, onToggleAttribute(kind, path, on): void }} state
  */
-export function showInspector(panel, { entry, index, selection, diff, onSelect, onReveal, onJump }) {
+export function showInspector(panel, { entry, index, selection, diff, shown, onSelect, onReveal, onJump, onToggleAttribute }) {
   panel.replaceChildren();
   if (!entry) {
     panel.append(element("h3", "No graph selected"), element("p", "Load a valid JSON Graph document to inspect its structure."));
@@ -95,6 +128,10 @@ export function showInspector(panel, { entry, index, selection, diff, onSelect, 
       list.append(element("dt", label), element("dd", value));
     }
     panel.append(list);
+  }
+  if (selection) {
+    const entries = attributeEntries(data, selection.kind, selection.kind === "node" ? selection.id : undefined);
+    if (entries.length) panel.append(attributeTable(entries, selection.kind, shown[selection.kind], onToggleAttribute));
   }
   panel.append(button("Show in source", () => selection ? onReveal(selection.kind, selection.id) : onJump(path)));
   if (selection?.kind === "node") {

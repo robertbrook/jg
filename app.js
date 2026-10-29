@@ -3,7 +3,7 @@ import { createEditor } from "./editor.js";
 import { examples } from "./example.js";
 import { $, element, button, status, save } from "./ui.js";
 import { showDiagnostics, diagnosticReport } from "./diagnostics-view.js";
-import { parseDocumentUrl, fetchDocument, encodeShare, decodeShare } from "./loading.js";
+import { parseDocumentUrl, fetchDocument, encodeShare, decodeShare, SHARE_WARN_LENGTH, SHARE_MAX_LENGTH } from "./loading.js";
 import { createViewer } from "./viewer.js";
 import { createLayoutEngine } from "./layout.js";
 import { showInspector, itemPath } from "./inspector.js";
@@ -123,7 +123,8 @@ function refreshDiff() {
 function inspect() {
   $("clear-selection").hidden = !selection;
   showInspector($("inspector"), {
-    entry: active(), index: current, selection, diff,
+    entry: active(), index: current, selection, diff, shown: shownAttributes,
+    onToggleAttribute: (kind, path, on) => setAttributeShown(kind, path, on),
     onSelect: (kind, id) => selectItem(kind, id),
     onReveal: (kind, id) => revealInSource(kind, id, true),
     onJump: path => jumpTo(path)
@@ -192,6 +193,16 @@ function currentDot() {
   const { graph } = active();
   return toDot(graph, { labels: $("labels").checked, compact: previewMode(graph).mode === "compact", attributes: shownAttributes });
 }
+function setAttributeShown(kind, path, on) {
+  const rest = shownAttributes[kind].filter(item => item !== path);
+  shownAttributes = { ...shownAttributes, [kind]: on ? [...rest, path] : rest };
+  const focused = $("inspector").contains(document.activeElement) ? document.activeElement.getAttribute("aria-label") : null;
+  saveSettings();
+  buildAttributeMenu();
+  inspect();
+  if (focused) $("inspector").querySelector(`[aria-label="${CSS.escape(focused)}"]`)?.focus();
+  render();
+}
 // Lists the attributes the active graph uses; ticked ones appear as extra lines in the diagram's labels.
 function buildAttributeMenu() {
   const box = $("attribute-options");
@@ -210,11 +221,8 @@ function buildAttributeMenu() {
       input.type = "checkbox";
       input.checked = shownAttributes[kind].includes(path);
       input.addEventListener("change", () => {
-        shownAttributes[kind] = input.checked ? [...shownAttributes[kind], path] : shownAttributes[kind].filter(item => item !== path);
-        saveSettings();
-        buildAttributeMenu();
+        setAttributeShown(kind, path, input.checked);
         box.querySelector(`input[data-path="${CSS.escape(`${kind}:${path}`)}"]`)?.focus();
-        render();
       });
       input.dataset.path = `${kind}:${path}`;
       label.append(input, ` ${path}`);
@@ -432,8 +440,11 @@ async function share() {
     url.search = "";
     url.hash = `doc=${await encodeShare(editor.value, filename)}`;
     const size = url.href.length;
-    try { await navigator.clipboard.writeText(url.href); status(`Share link copied (${Math.ceil(size / 1024)} KB). The document travels in the link; nothing is uploaded.${size > 64000 ? " Long links may be cut off by some apps." : ""}`); }
-    catch { window.prompt("Copy this link:", url.href); }
+    const alternative = "Save JSON and send the file, or publish it (for example as a GitHub Gist) and share a ?url= link.";
+    if (size > SHARE_MAX_LENGTH) { status(`This document is too large for a share link (${size.toLocaleString()} characters). ${alternative}`); return; }
+    const note = size > SHARE_WARN_LENGTH ? ` It is ${size.toLocaleString()} characters long; chat and email apps may cut it off. ${alternative}` : " The document travels in the link; nothing is uploaded.";
+    try { await navigator.clipboard.writeText(url.href); status(`Share link copied.${note}`); }
+    catch { window.prompt("Copy this link:", url.href); status(`Share link created.${note}`); }
   } catch (error) { status(`Cannot create a share link: ${error.message}`); }
 }
 async function openSharedDocument(encoded) {

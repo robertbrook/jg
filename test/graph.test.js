@@ -216,3 +216,22 @@ test("toDot with attributes renders in Graphviz", async () => {
     }
   }
 });
+
+test("share links round-trip every example exactly and stay short", async () => {
+  const { encodeShare, decodeShare } = await import("../loading.js");
+  for (const { text, file } of examples) {
+    const encoded = await encodeShare(text, file);
+    assert.match(encoded, /^[\w-]+$/);
+    assert.deepEqual(await decodeShare(encoded), { text, name: file });
+    assert.ok(encoded.length < text.length || text.length < 300, `${file} compresses`);
+  }
+  const unformatted = '{"graph":{"nodes":{"a":{}}}}';
+  assert.equal((await decodeShare(await encodeShare(unformatted, "x.json"))).text, unformatted, "non-2-space text is kept verbatim");
+});
+
+test("attributeEntries flattens an item using attributePaths' paths", async () => {
+  const { attributeEntries } = await import("../graph.js");
+  assert.deepEqual(attributeEntries({ label: "A", metadata: { type: "t", tags: [1], deep: { x: null } } }, "node", "a"),
+    [["id", "a"], ["metadata.type", "t"], ["metadata.tags", [1]], ["metadata.deep.x", null]]);
+  assert.deepEqual(attributeEntries({ source: "a", target: "b", relation: "r" }, "edge"), [["relation", "r"]]);
+});
