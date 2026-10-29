@@ -307,7 +307,7 @@ function startWorker() {
       mountSVG(data.svg);
       // sfdp always reports the missing triangulation library in the WASM build; layout is unaffected.
       const warnings = data.errors?.map(error => error.message).filter(message => !message.includes("triangulation library")).join("; ");
-      status(`Rendered in ${Math.round(data.duration)} ms${warnings ? ` · Graphviz: ${warnings}` : " · All processing stays in this browser"}`);
+      status(`Rendered in ${Math.round(data.duration)} ms${warnings ? ` · Graphviz: ${warnings}` : ""}`);
     } catch (error) {
       clearCanvas(`Cannot display the graph: ${error.message}`);
       status(`Preview failed: ${error.message}`);
