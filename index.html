@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<!--
+THESIS: An instrument panel for tracing JSON into relationships, not a dashboard of cards.
+OWN-WORLD: Cool white panels, slate rules, cobalt actions, system UI and code typography.
+STORY: Edit a document, locate a fault, then inspect the exact relationship it describes.
+FIRST VIEWPORT: Source left, graph center, inspector right; diagnostics directly below source.
+FORM: Instrument-panel workspace, candidate 5, seed ca3e9e67; persistent three-pane staging.
+-->
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>jg — JSON Graph workbench</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="identity"><span class="mark" aria-hidden="true">jg</span><div><h1>JSON Graph workbench</h1><p>Preview the structure. Find the fault.</p></div></div>
+    <div class="file-actions">
+      <span class="local-note"><span class="local-dot"></span> Local to your browser</span>
+      <button id="example" type="button">Load example</button>
+      <button id="open" class="primary" type="button">Open JSON file</button>
+      <input id="file" type="file" accept=".json,.jsonld,application/json" hidden>
+    </div>
+  </header>
+  <main class="workspace">
+    <section class="source-pane" aria-labelledby="source-heading">
+      <div class="pane-heading"><h2 id="source-heading">Document</h2><span class="version">JSON Graph v2.1</span></div>
+      <div class="source-toolbar"><span id="filename" title="example.json">example.json</span><div><button id="format" type="button" title="Format JSON (Ctrl or Command + Shift + F)">Format</button><button id="download" type="button">Save JSON</button></div></div>
+      <div class="editor-wrap">
+        <div id="line-numbers" aria-hidden="true">1</div>
+        <textarea id="source" aria-label="JSON Graph document" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea>
+      </div>
+      <div class="editor-footer"><span id="cursor">Ln 1, Col 1</span><span>Live preview <kbd>Ctrl</kbd> <kbd>Enter</kbd></span></div>
+      <section class="diagnostics" aria-labelledby="diagnostics-heading">
+        <div class="pane-heading"><h2 id="diagnostics-heading">Diagnostics</h2><span id="diagnostic-count">Checking…</span></div>
+        <div id="diagnostics" aria-live="polite"></div>
+      </section>
+    </section>
+
+    <section class="preview-pane" aria-labelledby="preview-heading">
+      <div class="pane-heading preview-heading">
+        <h2 id="preview-heading">Graph preview</h2>
+        <span id="engine-status" class="engine-status">Starting WASM…</span>
+      </div>
+      <div class="preview-toolbar">
+        <label class="sr-only" for="graph-select">Graph</label>
+        <select id="graph-select" title="Choose a graph"></select>
+        <label class="sr-only" for="layout">Layout</label>
+        <select id="layout" title="Layout engine"><option value="dot">Hierarchical</option><option value="neato">Force-directed</option><option value="circo">Circular</option></select>
+        <label class="checkbox"><input id="labels" type="checkbox" checked> Edge labels</label>
+      </div>
+      <div class="graph-summary" id="graph-summary">Reading document…</div>
+      <div id="viewport" class="viewport" aria-busy="true">
+        <div id="canvas"></div>
+        <div id="preview-message" class="preview-message" role="status">Preparing the layout engine…</div>
+        <div class="canvas-controls" aria-label="Graph view controls">
+          <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
+          <output id="zoom-level" aria-label="Zoom level">100%</output>
+          <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
+          <button id="fit" type="button">Fit</button>
+        </div>
+      </div>
+      <div class="preview-footer"><span>Drag background to pan · Scroll to zoom</span><button id="retry-engine" type="button" hidden>Retry engine</button><button id="export" type="button" disabled>Export SVG</button></div>
+    </section>
+
+    <aside class="inspector-pane" aria-labelledby="inspector-heading">
+      <div class="pane-heading"><h2 id="inspector-heading">Inspector</h2><button id="clear-selection" type="button" hidden>Clear</button></div>
+      <div class="search-wrap"><label for="search">Find a node</label><input id="search" type="search" placeholder="Search ID or label…" autocomplete="off"></div>
+      <div id="search-results" class="search-results" hidden></div>
+      <div id="inspector" class="inspector"></div>
+      <div class="inspector-help"><h3>A direct line to your source</h3><p>Select a node or edge to inspect its data. Diagnostics point to the exact field that needs attention.</p><a href="https://github.com/jsongraph/json-graph-specification" target="_blank" rel="noreferrer">JSON Graph specification ↗</a></div>
+    </aside>
+  </main>
+  <footer class="app-footer"><span id="status" role="status">Initializing…</span><span>No uploads. No remote rendering.</span></footer>
+</body>
+</html>
