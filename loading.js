@@ -70,14 +70,24 @@ const fromBase64Url = text => Uint8Array.from(atob(text.replaceAll("-", "+").rep
 async function pipe(bytes, stream) {
   return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer());
 }
+export const SHARE_WARN_LENGTH = 8000;
+export const SHARE_MAX_LENGTH = 100000;
+// A 2-space formatted document is sent minified and reformatted on arrival, which keeps links shorter.
 export async function encodeShare(text, name) {
-  const payload = new TextEncoder().encode(JSON.stringify({ name, text }));
+  let message = { name, text };
+  try {
+    const parsed = JSON.parse(text);
+    if (JSON.stringify(parsed, null, 2) === text) message = { name, json: parsed, indent: 2 };
+  } catch { /* Invalid JSON is shared exactly as written. */ }
+  const payload = new TextEncoder().encode(JSON.stringify(message));
   return toBase64Url(await pipe(payload, new CompressionStream("deflate-raw")));
 }
 export async function decodeShare(encoded) {
   const bytes = await pipe(fromBase64Url(encoded), new DecompressionStream("deflate-raw"));
   if (bytes.length > MAX_SOURCE_BYTES) throw new Error("The shared document exceeds the 2 MiB limit.");
-  const { name, text } = JSON.parse(new TextDecoder().decode(bytes));
+  const message = JSON.parse(new TextDecoder().decode(bytes));
+  const { name } = message;
+  const text = message.indent ? JSON.stringify(message.json, null, message.indent) : message.text;
   if (typeof text !== "string") throw new Error("The link does not contain a document.");
   return { text, name: typeof name === "string" && name ? name : "shared.json" };
 }
