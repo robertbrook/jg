@@ -1,11 +1,12 @@
 // CodeMirror 6 wrapper. Bundled to dist/vendor/editor.js by build.mjs (esbuild).
-import { basicSetup } from "codemirror";
-import { undo } from "@codemirror/commands";
-import { EditorView, keymap, Decoration } from "@codemirror/view";
+import { EditorView, keymap, Decoration, lineNumbers, highlightActiveLineGutter, highlightSpecialChars, drawSelection, dropCursor, highlightActiveLine } from "@codemirror/view";
 import { EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
+import { history, undo, defaultKeymap, historyKeymap } from "@codemirror/commands";
+import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
+import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
 import { json } from "@codemirror/lang-json";
-import { setDiagnostics, lintGutter } from "@codemirror/lint";
-import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
+import { setDiagnostics, lintGutter, lintKeymap } from "@codemirror/lint";
+import { HighlightStyle, syntaxHighlighting, foldGutter, foldKeymap, indentOnInput, bracketMatching } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
 
 // Colours come from CSS custom properties so the editor follows light and dark mode automatically.
@@ -58,7 +59,20 @@ export function createEditor(parent, hooks) {
           { key: "Mod-Enter", run: () => { hooks.onRun(); return true; } },
           { key: "Shift-Mod-f", run: () => { hooks.onFormat(); return true; } }
         ])),
-        basicSetup,
+        // CodeMirror's basicSetup without autocompletion, rectangular selection, or the default highlight style.
+        lineNumbers(),
+        highlightActiveLineGutter(),
+        highlightSpecialChars(),
+        history(),
+        foldGutter(),
+        drawSelection(),
+        dropCursor(),
+        indentOnInput(),
+        bracketMatching(),
+        closeBrackets(),
+        highlightActiveLine(),
+        highlightSelectionMatches(),
+        keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...foldKeymap, ...lintKeymap]),
         json(),
         syntaxHighlighting(highlight),
         lintGutter(),

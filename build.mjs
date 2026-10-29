@@ -42,6 +42,9 @@ export async function build(out = "dist") {
 
 const relative = (entry, root) => `${entry.parentPath ?? entry.path}/${entry.name}`.slice(root.length + 1).replaceAll("\\", "/");
 
+// Gzipped size limits. The build fails if a file grows past its budget; raise a budget only deliberately.
+const BUDGETS = { "app.js": 160 * 1024, "styles.css": 6 * 1024, "index.html": 4 * 1024, "vendor/viz.js": 480 * 1024 };
+
 /** Raw and gzip size of each file, largest first, so bundle growth is visible in every build. */
 export async function sizes(out = "dist") {
   const result = [];
@@ -57,5 +60,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await build();
   const kb = bytes => `${(bytes / 1024).toFixed(1)} KB`.padStart(10);
   console.log("Built dist/\n      raw      gzip  file");
-  for (const { file, bytes, gzip } of await sizes()) console.log(`${kb(bytes)}${kb(gzip)}  ${file}${file === "vendor/viz.js" ? " (loaded only when a graph is drawn)" : ""}`);
+  const over = [];
+  for (const { file, bytes, gzip } of await sizes()) {
+    const budget = BUDGETS[file];
+    if (budget && gzip > budget) over.push(`${file} is ${kb(gzip).trim()} gzipped; the budget is ${kb(budget).trim()}`);
+    console.log(`${kb(bytes)}${kb(gzip)}  ${file}${budget ? `  (budget ${kb(budget).trim()})` : ""}${file === "vendor/viz.js" ? " · loaded only when a graph is drawn" : ""}`);
+  }
+  if (over.length) { console.error(`Size budget exceeded:\n  ${over.join("\n  ")}`); process.exitCode = 1; }
 }
