@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import Ajv from "ajv";
 import { instance } from "@viz-js/viz";
 import schema from "../schema/json-graph-schema_v2.json" with { type: "json" };
-import { analyzeSource, applyEdits, convertV1, getGraphs, graphStats, layoutSize, previewMode, toDot, pointer } from "../graph.js";
+import { analyzeSource, applyEdits, wrapLabel, convertV1, getGraphs, graphStats, layoutSize, previewMode, toDot, pointer } from "../graph.js";
 import { example, examples } from "../example.js";
 
 const json = value => JSON.stringify(value, null, 2);
@@ -159,4 +159,19 @@ test("every example loads as described", async () => {
   assert.equal(previewMode(analyzeSource(examples.find(item => item.id === "large").text).document.graph).mode, "compact");
   const broken = examples.find(item => item.id === "broken").text;
   assert.deepEqual(errors(analyzeSource(applyAll(broken, 20))), []);
+});
+
+test("long labels wrap to fit", async () => {
+  assert.equal(wrapLabel("Short"), "Short");
+  assert.equal(wrapLabel("Reviewed by the editorial board before release", 22), "Reviewed by the\neditorial board before\nrelease");
+  assert.equal(wrapLabel("abcdefghij", 6), "abcdef\nghij");
+  assert.equal(wrapLabel("https://example.org/articles/2026/long-id", 22), "https://example.org/\narticles/2026/long-id");
+  assert.equal(wrapLabel("one\ntwo"), "one\ntwo");
+  assert.equal(wrapLabel("a b c d e f", 1, 3), "a\nb\n…");
+  for (const line of wrapLabel("x".repeat(30) + " " + "word ".repeat(40)).split("\n")) assert.ok(line.length <= 22, line);
+  const viz = await instance();
+  const dot = toDot({ nodes: { a: { label: "A rather long node label that needs several lines" }, b: {} }, edges: [{ source: "a", target: "b", label: "an edge label that is also long" }] });
+  assert.match(dot, /label="A rather long node\\nlabel that needs\\nseveral lines"/);
+  const svg = viz.renderString(dot, { format: "svg" });
+  assert.ok((svg.match(/<text/g) ?? []).length >= 6);
 });

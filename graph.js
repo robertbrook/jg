@@ -654,6 +654,35 @@ export function graphStats(graph) {
   return { nodes: keys.length, links: links.length, components, isolated: keys.filter(id => degree.get(id) === 0).length, degree };
 }
 
+/**
+ * Graphviz sizes labels to their text but never wraps it, so long labels are broken into lines here.
+ * Words longer than the width are split, preferably after punctuation; after maxLines the label ends with an ellipsis.
+ */
+export function wrapLabel(value, width = 22, maxLines = 5) {
+  const lines = [];
+  for (const paragraph of String(value).split(/\r?\n/)) {
+    let line = "";
+    for (let word of paragraph.split(/\s+/).filter(Boolean)) {
+      while (word.length > width) {
+        if (line) { lines.push(line); line = ""; }
+        // Prefer breaking a long URL or identifier after punctuation; never insert characters that are not in the label.
+        const cut = Math.max(...[..."/.-_?&=:"].map(char => word.lastIndexOf(char, width - 1) + 1));
+        const at = cut > width / 3 ? cut : width;
+        lines.push(word.slice(0, at));
+        word = word.slice(at);
+      }
+      if (!line) line = word;
+      else if (line.length + 1 + word.length <= width) line += ` ${word}`;
+      else { lines.push(line); line = word; }
+    }
+    lines.push(line);
+  }
+  if (lines.length > maxLines) {
+    lines.length = maxLines;
+    lines[maxLines - 1] = `${lines[maxLines - 1].slice(0, width - 1)}…`;
+  }
+  return lines.join("\n");
+}
 function dotString(value) {
   return JSON.stringify(String(value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ""));
 }
@@ -679,9 +708,9 @@ export function toDot(graph, { labels = true, compact = false, colors = LIGHT_GR
     `edge [color="${colors.edge}", fontcolor="${colors.edgeText}", fontname="Helvetica", fontsize="10", arrowsize="0.65"];`
   ];
   for (const [id, node] of Object.entries(graph.nodes ?? {})) {
-    lines.push(compact ? `${ids.get(id)} [id="${ids.get(id)}"];` : `${ids.get(id)} [id="${ids.get(id)}", label=${dotString(node?.label ?? id)}];`);
+    lines.push(compact ? `${ids.get(id)} [id="${ids.get(id)}"];` : `${ids.get(id)} [id="${ids.get(id)}", label=${dotString(wrapLabel(node?.label ?? id))}];`);
   }
-  const attributes = (edge, index, directed) => `id="e${index}", dir="${directed ? "forward" : "none"}"${showLabels && (edge.label ?? edge.relation) ? `, label=${dotString(edge.label ?? edge.relation)}` : ""}`;
+  const attributes = (edge, index, directed) => `id="e${index}", dir="${directed ? "forward" : "none"}"${showLabels && (edge.label ?? edge.relation) ? `, label=${dotString(wrapLabel(edge.label ?? edge.relation, 18, 3))}` : ""}`;
   if (graph.edges) graph.edges.forEach((edge, index) => {
     lines.push(`${ids.get(edge.source)} -> ${ids.get(edge.target)} [${attributes(edge, index, edge.directed ?? graph.directed ?? true)}];`);
   });
@@ -691,7 +720,7 @@ export function toDot(graph, { labels = true, compact = false, colors = LIGHT_GR
     const sources = directed ? edge.source : edge.nodes;
     for (const [memberIndex, id] of sources.entries()) lines.push(`${ids.get(id)} -> h${index} [id="e${index}s${memberIndex}", dir="none"];`);
     if (directed) for (const [memberIndex, id] of edge.target.entries()) lines.push(`h${index} -> ${ids.get(id)} [id="e${index}t${memberIndex}"];`);
-    if (showLabels && (edge.label || edge.relation)) lines.push(`h${index} [xlabel=${dotString(edge.label ?? edge.relation)}];`);
+    if (showLabels && (edge.label || edge.relation)) lines.push(`h${index} [xlabel=${dotString(wrapLabel(edge.label ?? edge.relation, 18, 3))}];`);
   });
   return `${lines.join("\n")}\n}`;
 }
