@@ -687,13 +687,59 @@ function dotString(value) {
   return JSON.stringify(String(value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ""));
 }
 
+const STRUCTURAL = { node: new Set(["label"]), edge: new Set(["source", "target", "nodes", "label"]) };
+const MAX_ATTRIBUTES = 60;
+/** Reads a dotted attribute path such as "metadata.type". "id" on a node is its key in the nodes object. */
+export function attributeValue(item, path, id) {
+  if (path === "id" && id !== undefined) return id;
+  let value = item;
+  for (const key of path.split(".")) {
+    if (value === null || typeof value !== "object" || !Object.hasOwn(value, key)) return undefined;
+    value = value[key];
+  }
+  return value;
+}
+/** Lists the scalar attribute paths used by a graph's nodes and edges, most common first. */
+export function attributePaths(graph) {
+  const collect = (items, kind) => {
+    const counts = new Map();
+    const walk = (value, prefix, depth) => {
+      for (const [key, child] of Object.entries(value)) {
+        const path = prefix ? `${prefix}.${key}` : key;
+        if (!prefix && STRUCTURAL[kind].has(key)) continue;
+        if (child !== null && typeof child === "object" && !Array.isArray(child)) { if (depth < 3) walk(child, path, depth + 1); }
+        else counts.set(path, (counts.get(path) ?? 0) + 1);
+      }
+    };
+    for (const item of items) if (item && typeof item === "object") walk(item, "", 0);
+    return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, MAX_ATTRIBUTES).map(([path]) => path);
+  };
+  const nodes = Object.values(graph?.nodes ?? {});
+  return { node: nodes.length ? ["id", ...collect(nodes, "node")] : [], edge: collect(graph?.edges ?? graph?.hyperedges ?? [], "edge") };
+}
+const attributeText = value => {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  return text.length > 40 ? `${text.slice(0, 39)}…` : text;
+};
+const htmlEscape = text => String(text).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "").replace(/[&<>"]/g, char => `&#${char.charCodeAt(0)};`);
+// Graphviz HTML-like label: the label, then each attribute on its own smaller line.
+function richLabel(title, item, paths, id, width, lines, size, color) {
+  const extra = paths.map(path => [path, attributeValue(item, path, id)]).filter(([, value]) => value !== undefined);
+  if (!extra.length) return title === undefined ? null : dotString(wrapLabel(title, width, lines));
+  const rows = title === undefined ? [] : [wrapLabel(title, width, lines).split("\n").map(htmlEscape).join("<BR/>")];
+  for (const [path, value] of extra) rows.push(`<FONT POINT-SIZE="${size}" COLOR="${color}">${htmlEscape(`${path}: ${attributeText(value)}`)}</FONT>`);
+  return `<${rows.join("<BR/>")}>`;
+}
+
 export const LIGHT_GRAPH_COLORS = { node: "#ffffff", border: "#a6b8d0", text: "#233346", edge: "#8da1bc", edgeText: "#526781", junction: "#dce7f7" };
 
 /**
  * Converts one JSON Graph graph to Graphviz DOT.
  * compact: dots without labels for large graphs (paired with the sfdp engine).
  */
-export function toDot(graph, { labels = true, compact = false, colors = LIGHT_GRAPH_COLORS } = {}) {
+export function toDot(graph, { labels = true, compact = false, colors = LIGHT_GRAPH_COLORS, attributes = {} } = {}) {
+  const nodeAttributes = compact ? [] : attributes.node ?? [];
+  const edgeAttributes = compact || !labels ? [] : attributes.edge ?? [];
   const ids = new Map(Object.keys(graph.nodes ?? {}).map((id, index) => [id, `n${index}`]));
   const showLabels = labels && !compact;
   const lines = compact ? [
@@ -708,11 +754,15 @@ export function toDot(graph, { labels = true, compact = false, colors = LIGHT_GR
     `edge [color="${colors.edge}", fontcolor="${colors.edgeText}", fontname="Helvetica", fontsize="10", arrowsize="0.65"];`
   ];
   for (const [id, node] of Object.entries(graph.nodes ?? {})) {
-    lines.push(compact ? `${ids.get(id)} [id="${ids.get(id)}"];` : `${ids.get(id)} [id="${ids.get(id)}", label=${dotString(wrapLabel(node?.label ?? id))}];`);
+    lines.push(compact ? `${ids.get(id)} [id="${ids.get(id)}"];` : `${ids.get(id)} [id="${ids.get(id)}", label=${richLabel(node?.label ?? id, node, nodeAttributes, id, 22, 5, 10, colors.edgeText)}];`);
   }
-  const attributes = (edge, index, directed) => `id="e${index}", dir="${directed ? "forward" : "none"}"${showLabels && (edge.label ?? edge.relation) ? `, label=${dotString(wrapLabel(edge.label ?? edge.relation, 18, 3))}` : ""}`;
+  const edgeLabel = edge => showLabels ? richLabel(edge.label ?? edge.relation, edge, edgeAttributes, undefined, 18, 3, 9, colors.edgeText) : null;
+  const edgeDot = (edge, index, directed) => {
+    const label = edgeLabel(edge);
+    return `id="e${index}", dir="${directed ? "forward" : "none"}"${label ? `, label=${label}` : ""}`;
+  };
   if (graph.edges) graph.edges.forEach((edge, index) => {
-    lines.push(`${ids.get(edge.source)} -> ${ids.get(edge.target)} [${attributes(edge, index, edge.directed ?? graph.directed ?? true)}];`);
+    lines.push(`${ids.get(edge.source)} -> ${ids.get(edge.target)} [${edgeDot(edge, index, edge.directed ?? graph.directed ?? true)}];`);
   });
   if (graph.hyperedges) graph.hyperedges.forEach((edge, index) => {
     const directed = !Array.isArray(edge.nodes);
@@ -720,7 +770,8 @@ export function toDot(graph, { labels = true, compact = false, colors = LIGHT_GR
     const sources = directed ? edge.source : edge.nodes;
     for (const [memberIndex, id] of sources.entries()) lines.push(`${ids.get(id)} -> h${index} [id="e${index}s${memberIndex}", dir="none"];`);
     if (directed) for (const [memberIndex, id] of edge.target.entries()) lines.push(`h${index} -> ${ids.get(id)} [id="e${index}t${memberIndex}"];`);
-    if (showLabels && (edge.label || edge.relation)) lines.push(`h${index} [xlabel=${dotString(wrapLabel(edge.label ?? edge.relation, 18, 3))}];`);
+    const label = edgeLabel(edge);
+    if (label) lines.push(`h${index} [xlabel=${label}];`);
   });
   return `${lines.join("\n")}\n}`;
 }
@@ -738,4 +789,37 @@ export function layoutSize(graph) {
     nodes: Object.keys(graph.nodes ?? {}).length + (graph.hyperedges?.length ?? 0),
     links: graph.edges?.length ?? graph.hyperedges?.reduce((total, edge) => total + (edge.nodes?.length ?? edge.source.length + edge.target.length), 0) ?? 0
   };
+}
+
+const linkKey = (edge, hyper) => JSON.stringify(hyper ? [edge.nodes ?? null, edge.source ?? null, edge.target ?? null, edge.relation ?? null] : [edge.source, edge.target, edge.relation ?? null]);
+/**
+ * Compares two graphs. Nodes match by ID; edges match by source, target and relation (hyperedges by their member lists).
+ * Returns { nodes, links } where each has added and changed (node IDs or link indexes in `after`) and removed (descriptions).
+ */
+export function diffGraphs(before, after) {
+  const result = { nodes: { added: new Set(), changed: new Set(), removed: [] }, links: { added: new Set(), changed: new Set(), removed: [] } };
+  const oldNodes = before?.nodes ?? {};
+  const newNodes = after?.nodes ?? {};
+  for (const [id, node] of Object.entries(newNodes)) {
+    if (!Object.hasOwn(oldNodes, id)) result.nodes.added.add(id);
+    else if (JSON.stringify(oldNodes[id]) !== JSON.stringify(node)) result.nodes.changed.add(id);
+  }
+  for (const [id, node] of Object.entries(oldNodes)) if (!Object.hasOwn(newNodes, id)) result.nodes.removed.push(node?.label ? `${node.label} (${id})` : id);
+  const hyper = Boolean(after?.hyperedges);
+  const oldLinks = new Map();
+  for (const edge of (hyper ? before?.hyperedges : before?.edges) ?? []) {
+    const key = linkKey(edge, hyper);
+    oldLinks.set(key, [...(oldLinks.get(key) ?? []), edge]);
+  }
+  ((hyper ? after?.hyperedges : after?.edges) ?? []).forEach((edge, index) => {
+    const matches = oldLinks.get(linkKey(edge, hyper));
+    if (!matches?.length) { result.links.added.add(index); return; }
+    const same = matches.findIndex(old => JSON.stringify(old) === JSON.stringify(edge));
+    if (same < 0) result.links.changed.add(index);
+    matches.splice(Math.max(0, same), 1);
+  });
+  for (const edges of oldLinks.values()) for (const edge of edges) {
+    result.links.removed.push(edge.label ?? edge.relation ?? (hyper ? "hyperedge" : `${edge.source} → ${edge.target}`));
+  }
+  return result;
 }

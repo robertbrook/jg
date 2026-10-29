@@ -1,0 +1,11 @@
+{
+  "name": "JSON Graph workbench",
+  "short_name": "jg",
+  "description": "Preview and debug JSON Graph Format documents in your browser.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0969da",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

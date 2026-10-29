@@ -1,11 +1,9 @@
 name: Deploy GitHub Pages
 
-# Publishes main at /jg/ and every open same-repository pull request at /jg/preview/pr-N/.
+# Publishes main at /jg/. Pull requests are checked by ci.yml, which uploads a site artifact to preview locally.
 on:
   push:
     branches: [main]
-  pull_request_target:
-    types: [opened, synchronize, reopened, closed]
   workflow_dispatch:
 
 permissions:
@@ -20,11 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -34,27 +30,10 @@ jobs:
       - run: npm run build
         env:
           DEPLOY: 1
-      - run: mv dist site
-      - name: Build pull request previews
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 50 \
-            --json number,headRefOid,isCrossRepository \
-            --jq '.[] | select(.isCrossRepository | not) | "\(.number) \(.headRefOid)"' |
-          while read -r number sha; do
-            dir="$RUNNER_TEMP/pr-$number"
-            git fetch --quiet --depth 1 origin "$sha" &&
-            git worktree add --quiet --detach "$dir" "$sha" &&
-            (cd "$dir" && npm ci --ignore-scripts --no-audit --no-fund && DEPLOY=1 npm run build) < /dev/null &&
-            mkdir -p site/preview && mv "$dir/dist" "site/preview/pr-$number" &&
-            echo "Built preview for #$number" ||
-            echo "::warning::Preview for #$number failed to build; skipped."
-          done
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: site
+          path: dist
 
   deploy:
     needs: build
@@ -69,26 +48,3 @@ jobs:
       - id: deployment
         uses: actions/deploy-pages@v4
 
-  comment:
-    needs: deploy
-    if: github.event_name == 'pull_request_target' && github.event.action != 'closed' && !github.event.pull_request.head.repo.fork
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-    steps:
-      - name: Post preview link
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NUMBER: ${{ github.event.pull_request.number }}
-          SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          marker="<!-- jg-preview -->"
-          body="$marker
-          **Preview:** https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/preview/pr-${NUMBER}/ (built from ${SHA::7})"
-          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" --paginate \
-            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
-          if [ -n "$id" ]; then
-            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$body"
-          else
-            gh api "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" -f body="$body"
-          fi

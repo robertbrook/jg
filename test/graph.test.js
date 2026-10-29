@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import Ajv from "ajv";
 import { instance } from "@viz-js/viz";
 import schema from "../schema/json-graph-schema_v2.json" with { type: "json" };
-import { analyzeSource, applyEdits, wrapLabel, convertV1, getGraphs, graphStats, layoutSize, previewMode, toDot, pointer } from "../graph.js";
+import { analyzeSource, applyEdits, attributePaths, attributeValue, diffGraphs, wrapLabel, convertV1, getGraphs, graphStats, layoutSize, previewMode, toDot, pointer } from "../graph.js";
 import { example, examples } from "../example.js";
 
 const json = value => JSON.stringify(value, null, 2);
@@ -174,4 +174,45 @@ test("long labels wrap to fit", async () => {
   assert.match(dot, /label="A rather long node\\nlabel that needs\\nseveral lines"/);
   const svg = viz.renderString(dot, { format: "svg" });
   assert.ok((svg.match(/<text/g) ?? []).length >= 6);
+});
+
+test("diffGraphs reports added, changed, and removed nodes and edges", () => {
+  const before = { nodes: { a: { label: "A" }, b: {}, gone: { label: "Gone" } }, edges: [{ source: "a", target: "b" }, { source: "b", target: "gone" }, { source: "a", target: "b", relation: "r", label: "x" }] };
+  const after = { nodes: { a: { label: "A2" }, b: {}, c: {} }, edges: [{ source: "a", target: "b" }, { source: "a", target: "b", relation: "r", label: "y" }, { source: "b", target: "c" }] };
+  const diff = diffGraphs(before, after);
+  assert.deepEqual([...diff.nodes.added], ["c"]);
+  assert.deepEqual([...diff.nodes.changed], ["a"]);
+  assert.deepEqual(diff.nodes.removed, ["Gone (gone)"]);
+  assert.deepEqual([...diff.links.added], [2]);
+  assert.deepEqual([...diff.links.changed], [1]);
+  assert.deepEqual(diff.links.removed, ["b → gone"]);
+  const same = diffGraphs(after, after);
+  assert.equal(same.nodes.added.size + same.nodes.changed.size + same.links.added.size + same.links.changed.size, 0);
+});
+
+test("attributePaths lists scalar attributes and toDot shows chosen ones", () => {
+  const graph = { nodes: { a: { label: "A", metadata: { type: "person", score: 3, tags: ["x"] } }, b: { metadata: { type: "<org>" } } }, edges: [{ source: "a", target: "b", relation: "knows", metadata: { since: 2020 } }] };
+  const paths = attributePaths(graph);
+  assert.deepEqual(paths.node, ["id", "metadata.type", "metadata.score", "metadata.tags"]);
+  assert.deepEqual(paths.edge, ["metadata.since", "relation"]);
+  assert.equal(attributeValue(graph.nodes.a, "metadata.type"), "person");
+  assert.equal(attributeValue(graph.nodes.a, "id", "a"), "a");
+  assert.equal(attributeValue(graph.nodes.a, "metadata.missing"), undefined);
+  const dot = toDot(graph, { attributes: { node: ["metadata.type"], edge: ["metadata.since"] } });
+  assert.match(dot, /label=<A<BR\/><FONT POINT-SIZE="10" COLOR="[^"]+">metadata\.type: person<\/FONT>>/);
+  assert.match(dot, /metadata\.type: &#60;org&#62;/, "HTML labels are escaped");
+  assert.match(dot, /label=<knows<BR\/><FONT[^>]*>metadata\.since: 2020<\/FONT>>/);
+  assert.doesNotMatch(toDot(graph, { compact: true, attributes: { node: ["metadata.type"] } }), /FONT/);
+  assert.doesNotMatch(toDot(graph, { labels: false, attributes: { edge: ["metadata.since"] } }), /since/);
+});
+
+test("toDot with attributes renders in Graphviz", async () => {
+  const viz = await instance();
+  for (const { text } of examples) {
+    for (const { graph } of getGraphs(analyzeSource(text).document ?? {})) {
+      if (!graph?.nodes || analyzeSource(text).diagnostics.some(item => item.severity === "error")) continue;
+      const result = viz.render(toDot(graph, { attributes: attributePaths(graph) }), { engine: "dot", format: "svg" });
+      assert.equal(result.status, "success", result.errors.map(error => error.message).join("; "));
+    }
+  }
 });
