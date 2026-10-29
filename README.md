@@ -34,13 +34,13 @@ The page footer shows when the site was built or last deployed, linking to the s
 - **Quick fixes:** rename mistyped properties, move custom fields into `metadata`, correct node references, add missing nodes, unquote booleans, fix trailing or missing commas, close brackets, and more. Each fix is one undo step, and an **Undo** button appears in the footer.
 - **JSON Graph v1 import:** documents with node arrays can be converted to v2 node maps in one click.
 - **Preview:** Graphviz compiled to WebAssembly runs in a worker and loads only when there is something to draw. Hierarchical layout; hyperedges appear as diamond junctions. Graphs up to 500 nodes render in full; up to 5,000 nodes render in a compact dots-only mode.
-- **Attributes:** the **Attributes** menu lists the attributes the graph's nodes and edges use (for example `metadata.type`); ticked ones appear as extra lines in the diagram's labels. The choice is remembered.
+- **Attributes:** the **Attributes** menu lists the attributes the graph's nodes and edges use (for example `metadata.type`); ticked ones appear as extra lines in the diagram's labels. The Inspector also lists every attribute of the selected node or edge, each with a **Show** toggle. The choice is remembered.
 - **Linked selection:** selecting a node or edge highlights its source; moving the cursor in the source selects it in the diagram. Double-click a diagram item to edit it. Tab to a node and use the **arrow keys** to move to the nearest node in that direction, preferring connected nodes.
 - **Minimap:** when zoomed in, a minimap shows the visible area; drag it to move around.
 - **Changes:** tick **Changes** to highlight nodes and edges added (green) or changed (amber, dashed) since the document was opened or saved, or compare with another file with **Open › Compare with file…**. Removed items are listed in the Inspector.
 - **Inspector:** details of the selected item, its connections, and its source object, with URLs as links. The graph overview includes a text **outline** of every node and its targets, for screen readers and large graphs.
 - **Loading:** paste, use **Open** for a file or URL, or drag and drop a file or link. GitHub and Gist links are converted to raw URLs; the server must allow CORS. `?url=` links are shareable.
-- **Share:** copies a link that contains the whole document, compressed into the URL's `#` fragment, so nothing is uploaded.
+- **Share:** copies a link that contains the whole document, compressed into the URL's `#` fragment, so nothing is uploaded. Links over 8,000 characters come with a warning that some apps cut them off; documents whose links would exceed 100,000 characters must be shared as a file or a `?url=` link instead.
 - **Export:** SVG, PNG, or Graphviz DOT from the **Export** menu.
 - **Offline:** after the first visit, the workbench works offline and can be installed as an app. A service worker serves from the network first, so new deployments appear on the next load.
 - **Examples:** the example menu includes directed and undirected graphs, self-loops and parallel edges, multiple graphs, directed and undirected hyperedges, and a large 800-node graph. Debugging practice documents have schema errors, a JSON syntax error, or use JSON Graph v1.
@@ -76,7 +76,7 @@ Documents are never uploaded. Graphviz receives generated DOT only, and its SVG 
 
 ```sh
 npm test       # unit tests, including an Ajv cross-check and Graphviz rendering
-npm run build  # also prints the size of every file, raw and gzipped
+npm run build  # also prints every file's size and fails if one exceeds its gzip budget
 npx playwright install chromium && npm run smoke   # browser smoke test of every example and the main controls
 ```
 

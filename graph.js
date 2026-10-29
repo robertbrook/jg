@@ -699,6 +699,20 @@ export function attributeValue(item, path, id) {
   }
   return value;
 }
+/** Flattens one node or edge into [path, value] pairs, using the same paths as attributePaths. */
+export function attributeEntries(item, kind, id) {
+  const entries = kind === "node" && id !== undefined ? [["id", id]] : [];
+  const walk = (value, prefix, depth) => {
+    for (const [key, child] of Object.entries(value)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (!prefix && STRUCTURAL[kind].has(key)) continue;
+      if (child !== null && typeof child === "object" && !Array.isArray(child) && depth < 3) walk(child, path, depth + 1);
+      else entries.push([path, child]);
+    }
+  };
+  if (item && typeof item === "object") walk(item, "", 0);
+  return entries;
+}
 /** Lists the scalar attribute paths used by a graph's nodes and edges, most common first. */
 export function attributePaths(graph) {
   const collect = (items, kind) => {

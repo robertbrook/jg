@@ -109,6 +109,13 @@ h2 { font-size: 1rem; }
 .connection { display: block; width: 100%; margin: 4px 0; text-align: left; overflow-wrap: anywhere; }
 .link-button { padding: 0; border: 0; background: none; color: var(--accent); font: inherit; text-decoration: underline; cursor: pointer; text-align: left; }
 .outline, .changes { margin-top: 14px; }
+table.attributes { width: 100%; margin: 12px 0; border-collapse: collapse; font-size: .9em; table-layout: fixed; }
+table.attributes caption { text-align: left; font-weight: bold; margin-bottom: 4px; }
+table.attributes th, table.attributes td { padding: 3px 4px; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+table.attributes thead th { color: var(--muted); font-weight: normal; }
+table.attributes tbody th { font-weight: normal; color: var(--muted); }
+table.attributes thead th:first-child { width: 45%; }
+table.attributes :is(th, td):last-child { width: 3.5em; text-align: center; }
 .outline summary { cursor: pointer; font-weight: bold; }
 .outline ul, .changes ul { margin: 6px 0 0; padding-left: 18px; }
 .outline li { margin: 2px 0; overflow-wrap: anywhere; }

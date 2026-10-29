@@ -82,6 +82,16 @@ await check("attributes appear in labels", async page => {
   await page.waitForFunction(() => document.querySelector("#canvas svg")?.textContent.includes("id: "), null, { timeout: 30000 });
 });
 
+await check("inspector attribute toggle shows the attribute in the diagram", async page => {
+  await page.waitForSelector("#canvas svg [data-kind='node']", { timeout: 30000 });
+  await page.locator("#canvas [data-kind='node']").first().click();
+  const toggle = page.locator("#inspector table.attributes input[aria-label='Show id in the diagram']");
+  await toggle.check();
+  await page.waitForFunction(() => document.querySelector("#canvas svg")?.textContent.includes("id: "), null, { timeout: 30000 });
+  assert.equal(await page.locator("#attribute-options input[data-path='node:id']").isChecked(), true, "menu reflects the toggle");
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("aria-label")), "Show id in the diagram", "focus is kept");
+});
+
 await check("quick fix and undo", async page => {
   const debug = examples.find(example => example.kind === "debug");
   await page.selectOption("#example", debug.id);
