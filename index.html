@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>jg — JSON Graph workbench</title>
+  <meta name="description" content="Preview and debug JSON Graph Format documents in your browser.">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./styles.css">
   <script type="module" src="./app.js"></script>
 </head>
@@ -13,84 +16,79 @@
     <h1>JSON Graph workbench</h1>
     <div class="file-actions">
       <label class="sr-only" for="example">Load an example</label>
-      <select id="example"><option value="">Load example…</option></select>
-      <button id="open-url" type="button" aria-expanded="false" aria-controls="url-form">Load from URL</button>
-      <button id="open" class="primary" type="button">Open JSON file</button>
+      <select id="example"><option value="">Examples…</option></select>
+      <label class="sr-only" for="open">Open a document</label>
+      <select id="open">
+        <option value="">Open…</option>
+        <option value="file">File…</option>
+        <option value="url">URL…</option>
+        <option value="compare">Compare with file…</option>
+      </select>
       <input id="file" type="file" accept=".json,.jsonld,application/json" hidden>
     </div>
   </header>
   <form id="url-form" class="url-form" hidden>
     <label for="url-input">Document URL</label>
     <input id="url-input" type="url" inputmode="url" placeholder="https://raw.githubusercontent.com/…/graph.json" autocomplete="url" spellcheck="false" required>
-    <button id="url-submit" class="primary" type="submit">Load</button>
+    <button id="url-submit" type="submit">Load</button>
     <button id="url-cancel" type="button">Cancel</button>
     <p id="url-message" class="url-message">Fetched directly by your browser. The server must allow cross-origin requests (CORS). GitHub file links are converted to raw URLs.</p>
   </form>
   <main id="workspace" class="workspace">
-    <section id="source-pane" class="source-pane" aria-labelledby="source-heading">
-      <div class="pane-heading"><h2 id="source-heading">Document</h2><span class="version">JSON Graph v2.1</span><button class="pane-hide" type="button" data-pane="source" aria-controls="source-pane" title="Hide the Document pane">Hide</button></div>
-      <div class="source-toolbar"><span id="filename" title="example.json">example.json</span><div><button id="format" type="button" title="Format JSON (Ctrl or Command + Shift + F)">Format</button><button id="download" type="button">Save JSON</button></div></div>
+    <section id="source-pane" class="source-pane" aria-label="Document">
+      <div class="toolbar"><span id="filename" title="example.json">example.json</span><button id="format" type="button" title="Format JSON (Ctrl or Command + Shift + F)">Format</button><button id="download" type="button">Save JSON</button><button id="share" type="button" title="Copy a link that contains this document">Share</button><button class="pane-hide" type="button" data-pane="source" aria-controls="source-pane" title="Hide the Document pane">Hide</button></div>
       <div id="editor" class="editor-wrap"></div>
       <div class="editor-footer"><span id="cursor">Ln 1, Col 1</span><span>Saved in this browser · Check now <kbd>Ctrl</kbd> <kbd>Enter</kbd></span></div>
       <section id="diagnostics-panel" class="diagnostics" aria-labelledby="diagnostics-heading">
-        <div class="pane-heading"><h2 id="diagnostics-heading">Diagnostics</h2><span id="diagnostic-count">Checking…</span><button id="expand-diagnostics" type="button" aria-pressed="false" title="Give diagnostics more room">Expand</button></div>
-        <div id="diagnostic-summary" class="diagnostic-summary"></div>
-        <div class="diagnostic-toolbar">
-          <div class="filters" role="group" aria-label="Filter by severity">
-            <button type="button" data-filter="all" aria-pressed="true">All <span></span></button>
-            <button type="button" data-filter="error" aria-pressed="false">Errors <span></span></button>
-            <button type="button" data-filter="warning" aria-pressed="false">Warnings <span></span></button>
-            <button type="button" data-filter="info" aria-pressed="false">Info <span></span></button>
-          </div>
-          <label class="checkbox"><input id="diagnostic-details" type="checkbox" checked> Details</label>
-          <button id="copy-report" type="button">Copy report</button>
-        </div>
+        <div class="toolbar"><h2 id="diagnostics-heading">Diagnostics</h2><span id="diagnostic-count">Checking…</span><button id="copy-report" type="button">Copy report</button><button id="expand-diagnostics" type="button" aria-pressed="false" title="Give diagnostics more room">Expand</button></div>
         <div id="diagnostics" aria-live="polite"></div>
       </section>
     </section>
 
     <button class="pane-tab" type="button" data-pane="source" aria-controls="source-pane" aria-expanded="false" title="Show the Document pane">Document</button>
-    <section id="preview-pane" class="preview-pane" aria-labelledby="preview-heading">
-      <div class="pane-heading preview-heading">
-        <h2 id="preview-heading">Graph preview</h2>
-        <span id="engine-status" class="engine-status">Graphviz WASM · loads on first preview</span>
-        <button class="pane-hide" type="button" data-pane="preview" aria-controls="preview-pane" title="Hide the Graph preview pane">Hide</button>
-      </div>
-      <div class="preview-toolbar">
+    <section id="preview-pane" class="preview-pane" aria-label="Graph preview">
+      <div class="toolbar">
         <label class="sr-only" for="graph-select">Graph</label>
         <select id="graph-select" title="Choose a graph"></select>
-        <label class="sr-only" for="layout">Layout</label>
-        <select id="layout" title="Layout engine"><option value="dot">Hierarchical</option><option value="neato">Force-directed</option><option value="circo">Circular</option></select>
         <label class="checkbox"><input id="labels" type="checkbox" checked> Edge labels</label>
+        <details id="attributes-menu" class="menu">
+          <summary>Attributes</summary>
+          <div id="attribute-options" class="menu-body"></div>
+        </details>
+        <label class="checkbox" title="Highlight nodes and edges that differ from the document as opened or saved, or from a file chosen with Open › Compare with file"><input id="changes" type="checkbox"> Changes</label>
+        <button class="pane-hide" type="button" data-pane="preview" aria-controls="preview-pane" title="Hide the Graph preview pane">Hide</button>
       </div>
-      <div class="preview-toolbar view-toolbar">
-        <span class="zoom-group" role="group" aria-label="Graph view controls">
-          <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
-          <output id="zoom-level" aria-label="Zoom level">100%</output>
-          <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
-          <button id="fit" type="button">Fit</button>
-        </span>
+      <div class="toolbar">
+        <span id="graph-summary" class="graph-summary">Reading document…</span>
+        <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
+        <output id="zoom-level" aria-label="Zoom level">100%</output>
+        <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
+        <button id="fit" type="button">Fit</button>
+        <label class="sr-only" for="export">Export the graph</label>
+        <select id="export" disabled>
+          <option value="">Export…</option>
+          <option value="svg">SVG image</option>
+          <option value="png">PNG image</option>
+          <option value="dot">Graphviz DOT</option>
+        </select>
         <button id="retry-engine" type="button" hidden>Retry engine</button>
-        <span class="export-group" role="group" aria-label="Export"><span class="export-label">Export</span><button id="export-svg" type="button" disabled>SVG</button><button id="export-png" type="button" disabled>PNG</button><button id="export-dot" type="button" disabled title="Graphviz DOT source">DOT</button></span>
       </div>
-      <div class="graph-summary"><span id="graph-summary">Reading document…</span><span class="view-hint">Drag to pan · Scroll to zoom · Double-click to edit</span></div>
-      <div id="viewport" class="viewport" aria-busy="true">
+      <div id="viewport" class="viewport" aria-busy="true" title="Drag to pan · Scroll to zoom · Double-click to edit">
         <div id="canvas"></div>
+        <div id="minimap" class="minimap" aria-hidden="true" title="Drag to move the view" hidden></div>
         <div id="preview-message" class="preview-message" role="status">Preparing the layout engine…</div>
       </div>
     </section>
 
     <button class="pane-tab" type="button" data-pane="preview" aria-controls="preview-pane" aria-expanded="false" title="Show the Graph preview pane">Graph preview</button>
-    <aside id="inspector-pane" class="inspector-pane" aria-labelledby="inspector-heading">
-      <div class="pane-heading"><h2 id="inspector-heading">Inspector</h2><button id="clear-selection" type="button" hidden>Clear</button><button class="pane-hide" type="button" data-pane="inspector" aria-controls="inspector-pane" title="Hide the Inspector pane">Hide</button></div>
-      <div class="search-wrap"><label for="search">Find a node</label><input id="search" type="search" placeholder="Search ID or label…" autocomplete="off"></div>
-      <div id="search-results" class="search-results" hidden></div>
+    <aside id="inspector-pane" class="inspector-pane" aria-label="Inspector">
+      <div class="toolbar"><span class="toolbar-title">Inspector</span><button id="clear-selection" type="button" hidden>Clear</button><button class="pane-hide" type="button" data-pane="inspector" aria-controls="inspector-pane" title="Hide the Inspector pane">Hide</button></div>
       <div id="inspector" class="inspector"></div>
-      <div class="inspector-help"><h3>A direct line to your source</h3><p>Select a node or edge to highlight its source; move the cursor in the source to select it here. Diagnostics point to the exact field and offer quick fixes.</p><a href="https://github.com/jsongraph/json-graph-specification" target="_blank" rel="noreferrer">JSON Graph specification ↗</a></div>
+      <p class="inspector-help"><a href="https://github.com/jsongraph/json-graph-specification" target="_blank" rel="noreferrer">JSON Graph specification ↗</a></p>
     </aside>
     <button class="pane-tab" type="button" data-pane="inspector" aria-controls="inspector-pane" aria-expanded="false" title="Show the Inspector pane">Inspector</button>
   </main>
   <div id="drop-zone" class="drop-zone" hidden><p>Drop a JSON file or link to open it</p></div>
-  <footer class="app-footer"><span id="status" role="status">Initializing…</span><span id="deployed" hidden></span></footer>
+  <footer class="app-footer"><span><span id="status" role="status">Initializing…</span> <button id="undo" type="button" hidden>Undo</button></span><span id="deployed" hidden></span></footer>
 </body>
 </html>

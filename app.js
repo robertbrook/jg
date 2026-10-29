@@ -1,47 +1,38 @@
-import { analyzeSource, applyEdits, getGraphs, graphStats, humanPath, previewMode, toDot, pointer, SCHEMA, MAX_SOURCE_BYTES, MAX_LAYOUT_NODES, MAX_LAYOUT_LINKS, MAX_COMPACT_NODES, MAX_COMPACT_LINKS } from "./graph.js";
-import { createEditor } from "./vendor/editor.js";
+import { analyzeSource, applyEdits, attributePaths, diffGraphs, getGraphs, graphStats, previewMode, toDot, MAX_SOURCE_BYTES, MAX_COMPACT_NODES, MAX_COMPACT_LINKS } from "./graph.js";
+import { createEditor } from "./editor.js";
 import { examples } from "./example.js";
+import { $, element, button, status, save } from "./ui.js";
+import { showDiagnostics, diagnosticReport } from "./diagnostics-view.js";
+import { parseDocumentUrl, fetchDocument, encodeShare, decodeShare } from "./loading.js";
+import { createViewer } from "./viewer.js";
+import { createLayoutEngine } from "./layout.js";
+import { showInspector, itemPath } from "./inspector.js";
 
-const $ = id => document.getElementById(id);
+const STORAGE_KEY = `jg:document:${location.pathname}`;
+const SETTINGS_KEY = "jg:settings";
+const PANES = ["source", "preview", "inspector"];
 let analysis;
 let analyzedText = "";
 let entries = [];
 let current = 0;
 let selection = null;
-let worker;
-let ready = false;
-let pending = false;
+let diff = null;
 let job = 0;
-let workerTimer;
 let editTimer;
-let svg = null;
-let baseView = null;
-let view = null;
-let lastLoaded = "";
-let filename = "example.json";
-let suppressClick = false;
-const MIN_ZOOM = 1;
-const MAX_ZOOM = 8;
-const active = () => entries[current];
-const hasErrors = () => analysis?.diagnostics.some(item => item.severity === "error");
-const element = (tag, text, className) => {
-  const node = document.createElement(tag);
-  if (text !== undefined) node.textContent = text;
-  if (className) node.className = className;
-  return node;
-};
-const button = (text, action, className) => {
-  const node = element("button", text, className);
-  node.type = "button";
-  node.addEventListener("click", action);
-  return node;
-};
-const status = message => { $("status").textContent = message; };
-
-const STORAGE_KEY = `jg:document:${location.pathname}`;
-const SETTINGS_KEY = "jg:settings";
 let saveTimer;
 let cursorTimer;
+let undoTimer;
+let applyingFix = false;
+let lastLoaded = "";
+let filename = "example.json";
+let comparison = null;
+let fileMode = "open";
+let hiddenPanes = new Set();
+let shownAttributes = { node: [], edge: [] };
+const active = () => entries[current];
+const hasErrors = () => analysis?.diagnostics.some(item => item.severity === "error");
+const baseName = () => filename.replace(/\.json$/i, "") || "graph";
+
 const editor = createEditor($("editor"), {
   label: "JSON Graph document",
   onChange: documentEdited,
@@ -54,6 +45,49 @@ const editor = createEditor($("editor"), {
   onFormat: () => format(),
   onFix: fix => applyFix(fix)
 });
+
+const viewer = createViewer({
+  canvas: $("canvas"),
+  minimap: $("minimap"),
+  controls: { zoomIn: $("zoom-in"), zoomOut: $("zoom-out"), fit: $("fit"), level: $("zoom-level") },
+  onSelect: (kind, id) => selectItem(kind, id),
+  onClear: () => selectItem(null),
+  onReveal: (kind, id) => revealInSource(kind, id, true)
+});
+
+const engine = createLayoutEngine({
+  onStarting: () => { $("retry-engine").hidden = true; },
+  onReady: () => { if (active() && !hasErrors()) render(); },
+  onFailure: message => {
+    $("retry-engine").hidden = false;
+    clearCanvas(message);
+    $("viewport").setAttribute("aria-busy", "false");
+    status(message);
+  },
+  onResult: data => {
+    if (data.id !== job) return;
+    $("viewport").setAttribute("aria-busy", "false");
+    if (!data.success) {
+      const message = (data.errors ?? []).map(error => error.message).join("; ");
+      clearCanvas(`Layout failed: ${message || "Graphviz returned no output"}.`);
+      status("Layout failed. The document remains available in the editor.");
+      return;
+    }
+    try {
+      viewer.mount(data.svg, active().graph, active().graph.label || "Graph preview");
+      $("preview-message").hidden = true;
+      $("export").disabled = false;
+      viewer.paint(selection, diff);
+      // sfdp always reports the missing triangulation library in the WASM build; layout is unaffected.
+      const warnings = data.errors?.map(error => error.message).filter(message => !message.includes("triangulation library")).join("; ");
+      status(`Rendered in ${Math.round(data.duration)} ms${warnings ? ` · Graphviz: ${warnings}` : ""}`);
+    } catch (error) {
+      clearCanvas(`Cannot display the graph: ${error.message}`);
+      status(`Preview failed: ${error.message}`);
+    }
+  }
+});
+
 function jumpTo(path, start, length = 0) {
   let location = analysis?.locations.get(path);
   while (!location && path) {
@@ -64,156 +98,38 @@ function jumpTo(path, start, length = 0) {
   const to = start === undefined ? location?.end ?? from : from + Math.max(1, length);
   editor.select(from, to);
 }
-const SEVERITY_LABEL = { error: "Error", warning: "Warning", info: "Info" };
-const MAX_RENDERED_DIAGNOSTICS = 200;
-let diagnosticFilter = "all";
-const plural = (count, word, many = `${word}s`) => `${count} ${count === 1 ? word : many}`;
-const severityCounts = () => {
-  const counts = { all: analysis.diagnostics.length, error: 0, warning: 0, info: 0 };
-  for (const item of analysis.diagnostics) counts[item.severity]++;
-  return counts;
-};
-function schemaState() {
-  const { summary } = analysis;
-  if (summary.schema === "not-run") return ["state-invalid", "Not run — the JSON must parse first"];
-  if (summary.schema === "valid") return ["state-valid", "Valid"];
-  if (summary.schema === "ambiguous") return ["state-ambiguous", "Accepted here; strict draft-07 validators reject (ambiguous oneOf)"];
-  return ["state-invalid", `Invalid · ${plural(summary.schemaErrors, "violation")}`];
-}
-function excerpt(diagnostic) {
-  if (!diagnostic.line) return null;
-  const lines = analyzedText.split("\n");
-  const index = diagnostic.line - 1;
-  if (index >= lines.length) return null;
-  const width = String(Math.min(lines.length, index + 2)).length;
-  const column = Math.max(0, (diagnostic.column ?? 1) - 1);
-  // Keep very long lines readable by windowing around the column.
-  const offset = Math.max(0, Math.min(column - 30, lines[index].length - 90));
-  const clip = text => {
-    const slice = text.slice(offset, offset + 100);
-    return (offset ? "…" : "") + slice + (text.length > offset + 100 ? "…" : "");
-  };
-  const block = element("pre", undefined, "excerpt");
-  if (index > 0) block.append(`${String(index).padStart(width)} │ ${clip(lines[index - 1])}\n`);
-  block.append(`${String(index + 1).padStart(width)} │ ${clip(lines[index])}\n`);
-  const span = Math.max(1, Math.min(diagnostic.length || 1, lines[index].length - column || 1, 60));
-  block.append(element("span", `${" ".repeat(width)} │ ${" ".repeat(column - offset + (offset ? 1 : 0))}${"^".repeat(span)}`, "caret"));
-  if (index + 1 < lines.length) block.append(`\n${String(index + 2).padStart(width)} │ ${clip(lines[index + 1])}`);
-  return block;
-}
-function detailRows(diagnostic) {
-  return [
-    ["Expected", diagnostic.expected],
-    ["Found", diagnostic.found],
-    ["Path", diagnostic.path !== undefined ? humanPath(diagnostic.path, analysis.document) : undefined],
-    ["JSON pointer", diagnostic.path !== undefined ? diagnostic.path || "(root)" : undefined],
-    ["Schema rule", diagnostic.schemaPath],
-    ["Code", diagnostic.code]
-  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
-}
-function renderDiagnostic(diagnostic) {
-  const item = element("article", undefined, `diagnostic ${diagnostic.severity}`);
-  const head = element("div", undefined, "diagnostic-head");
-  head.append(element("span", SEVERITY_LABEL[diagnostic.severity], "badge"), element("span", [diagnostic.category, diagnostic.keyword].filter(Boolean).join(" · "), "diagnostic-meta"));
-  const title = button(diagnostic.title ?? diagnostic.message, () => jumpTo(diagnostic.path, diagnostic.start, diagnostic.length), "diagnostic-title");
-  title.title = "Jump to this location in the document";
-  if (diagnostic.line) title.append(element("span", `Ln ${diagnostic.line}, Col ${diagnostic.column}`, "position"));
-  item.append(head, title);
-  if (diagnostic.title && diagnostic.message) item.append(element("p", diagnostic.message));
-  if (diagnostic.hint) {
-    const hint = element("p", undefined, "hint");
-    hint.append(element("strong", "Fix: "), diagnostic.hint);
-    item.append(hint);
-  }
-  if (diagnostic.fixes?.length) {
-    const actions = element("div", undefined, "fix-actions");
-    for (const fix of diagnostic.fixes) actions.append(button(fix.label, () => applyFix(fix), "fix"));
-    item.append(actions);
-  }
-  const rows = detailRows(diagnostic);
-  if (rows.length) {
-    const list = element("dl", undefined, "diagnostic-details");
-    for (const [term, value] of rows) list.append(element("dt", term), element("dd", value));
-    item.append(list);
-  }
-  for (const step of diagnostic.context ?? []) {
-    const box = element("div", undefined, "diagnostic-context");
-    box.append(element("p", `At ${step.at}, the schema offers ${step.count} alternatives (oneOf). Checked against the closest: ${step.chosen}.`));
-    if (step.alternatives?.length) {
-      const others = element("ul");
-      for (const alternative of step.alternatives) others.append(element("li", `${alternative.label} — ${alternative.reason}`));
-      box.append(others);
-    }
-    item.append(box);
-  }
-  const snippet = excerpt(diagnostic);
-  if (snippet) item.append(snippet);
-  return item;
-}
-function showDiagnostics() {
-  const list = $("diagnostics");
-  const counts = severityCounts();
-  const { summary } = analysis;
-  $("diagnostic-count").textContent = counts.all ? [plural(counts.error, "error"), plural(counts.warning, "warning"), counts.info ? `${counts.info} info` : ""].filter(Boolean).join(" · ") : "No issues";
-  for (const control of document.querySelectorAll("[data-filter]")) {
-    control.querySelector("span").textContent = counts[control.dataset.filter];
-    control.setAttribute("aria-pressed", String(control.dataset.filter === diagnosticFilter));
-  }
-  const [stateClass, stateText] = schemaState();
-  const summaryList = element("dl", undefined, "diagnostic-summary");
-  summaryList.replaceChildren(
-    element("dt", "Schema"), element("dd", [SCHEMA.file, SCHEMA.dialect, SCHEMA.id].filter(Boolean).join(" · ")),
-    element("dt", "Result"), element("dd", stateText, stateClass),
-    element("dt", "Contents"), element("dd", `${plural(summary.graphs, "graph")} · ${plural(summary.nodes, "node")} · ${plural(summary.links, "edge or hyperedge", "edges and hyperedges")}`),
-    element("dt", "Checks"), element("dd", `Syntax, duplicate keys, schema, node references, and graph semantics · ${summary.ms.toFixed(1)} ms`)
-  );
-  $("diagnostic-summary").replaceWith(summaryList);
-  summaryList.id = "diagnostic-summary";
-  list.classList.toggle("compact", !$("diagnostic-details").checked);
-  list.replaceChildren();
-  if (!counts.all) {
-    const healthy = element("div", "All checks passed", "healthy");
-    healthy.append(element("small", "The document is valid JSON Graph v2: it matches the official schema, has no duplicate keys, and every edge and hyperedge references a defined node."));
-    list.append(healthy);
-    return;
-  }
-  const shown = analysis.diagnostics.filter(item => diagnosticFilter === "all" || item.severity === diagnosticFilter);
-  if (!shown.length) list.append(element("p", `No ${diagnosticFilter === "info" ? "info" : `${diagnosticFilter}s`} in this document.`, "diagnostics-more"));
-  for (const diagnostic of shown.slice(0, MAX_RENDERED_DIAGNOSTICS)) list.append(renderDiagnostic(diagnostic));
-  if (shown.length > MAX_RENDERED_DIAGNOSTICS) list.append(element("p", `Showing the first ${MAX_RENDERED_DIAGNOSTICS} of ${shown.length}. Copy the report to see all of them.`, "diagnostics-more"));
-}
-function diagnosticReport() {
-  const counts = severityCounts();
-  const lines = [
-    `JSON Graph diagnostics — ${filename}`,
-    `Schema: ${SCHEMA.file} (${SCHEMA.dialect}) — ${schemaState()[1]}`,
-    `Totals: ${plural(counts.error, "error")}, ${plural(counts.warning, "warning")}, ${counts.info} info`,
-    ""
-  ];
-  analysis.diagnostics.forEach((diagnostic, index) => {
-    lines.push(`${index + 1}. [${SEVERITY_LABEL[diagnostic.severity]}] ${diagnostic.title ?? diagnostic.message}${diagnostic.line ? ` (Ln ${diagnostic.line}, Col ${diagnostic.column})` : ""}`);
-    if (diagnostic.title && diagnostic.message) lines.push(`   ${diagnostic.message}`);
-    for (const [term, value] of detailRows(diagnostic)) lines.push(`   ${term}: ${value}`);
-    for (const step of diagnostic.context ?? []) {
-      lines.push(`   oneOf at ${step.at}: closest is ${step.chosen}`);
-      for (const alternative of step.alternatives ?? []) lines.push(`     – ${alternative.label}: ${alternative.reason}`);
-    }
-    if (diagnostic.hint) lines.push(`   Fix: ${diagnostic.hint}`);
-    for (const fix of diagnostic.fixes ?? []) lines.push(`   Quick fix available: ${fix.label}`);
-    lines.push("");
-  });
-  return lines.join("\n");
-}
 function clearCanvas(message) {
-  svg = null;
-  baseView = null;
-  view = null;
-  $("canvas").replaceChildren();
+  viewer.clear();
   $("preview-message").textContent = message;
   $("preview-message").hidden = !message;
-  for (const id of ["zoom-in", "zoom-out", "fit", "export-svg", "export-png"]) $(id).disabled = true;
-  $("zoom-level").textContent = "—";
+  $("export").disabled = !active() || hasErrors();
 }
+
+// Compares the active graph with the matching graph (same id, else same position) in the baseline document.
+function computeDiff() {
+  if (!$("changes").checked || !active()) return null;
+  const baseline = comparison?.text ?? lastLoaded;
+  let before;
+  try { before = getGraphs(JSON.parse(baseline)); } catch { return null; }
+  const { graph } = active();
+  const match = (graph.id !== undefined && before.find(entry => entry.graph?.id === graph.id)) || before[current];
+  return diffGraphs(match?.graph ?? {}, graph);
+}
+function refreshDiff() {
+  diff = computeDiff();
+  viewer.paint(selection, diff);
+  inspect();
+}
+function inspect() {
+  $("clear-selection").hidden = !selection;
+  showInspector($("inspector"), {
+    entry: active(), index: current, selection, diff,
+    onSelect: (kind, id) => selectItem(kind, id),
+    onReveal: (kind, id) => revealInSource(kind, id, true),
+    onJump: path => jumpTo(path)
+  });
+}
+
 function update() {
   clearTimeout(editTimer);
   job++;
@@ -225,19 +141,14 @@ function update() {
   entries = hasErrors() ? [] : getGraphs(analysis.document);
   current = Math.min(current, Math.max(0, entries.length - 1));
   $("graph-select").replaceChildren();
-  entries.forEach(({ graph }, index) => {
-    const option = element("option", graph.label || graph.id || `Graph ${index + 1}`);
-    option.value = index;
-    $("graph-select").append(option);
-  });
-  if (!entries.length) $("graph-select").append(element("option", hasErrors() ? "Invalid document" : "No graphs"));
+  entries.forEach(({ graph }, index) => $("graph-select").append(new Option(graph.label || graph.id || `Graph ${index + 1}`, index)));
+  if (!entries.length) $("graph-select").append(new Option(hasErrors() ? "Invalid document" : "No graphs"));
   $("graph-select").value = String(current);
   $("graph-select").disabled = !entries.length;
-  $("search").value = "";
-  showDiagnostics();
-  showInspector();
-  $("export-dot").disabled = !active();
-  search();
+  showDiagnostics(analysis, analyzedText, { onJump: jumpTo, onFix: applyFix });
+  diff = computeDiff();
+  inspect();
+  buildAttributeMenu();
   if (hasErrors()) {
     clearCanvas("The document needs attention. Select a diagnostic to jump to its source.");
     $("graph-summary").textContent = "Preview paused · Fix document errors to continue";
@@ -254,75 +165,14 @@ function update() {
   }
   render();
 }
-function engineFailure(message) {
-  clearTimeout(workerTimer);
-  worker?.terminate();
-  ready = false;
-  pending = false;
-  $("engine-status").textContent = "Layout unavailable";
-  $("retry-engine").hidden = false;
-  clearCanvas(message);
-  $("viewport").setAttribute("aria-busy", "false");
-  status(message);
-}
-function startWorker() {
-  worker?.terminate();
-  clearTimeout(workerTimer);
-  ready = false;
-  pending = false;
-  $("retry-engine").hidden = true;
-  $("engine-status").textContent = "Starting WASM…";
-  try {
-    worker = new Worker(new URL("./layout-worker.js", import.meta.url), { type: "module" });
-  } catch (error) {
-    engineFailure(`Cannot start the layout worker: ${error.message}. Serve this page over HTTP, then retry.`);
-    return;
-  }
-  workerTimer = setTimeout(() => engineFailure("The WASM engine took too long to start. Retry the layout engine."), 15000);
-  worker.onerror = event => {
-    event.preventDefault();
-    engineFailure(`Layout worker failed: ${event.message || "could not load the WASM bundle"}. Retry the layout engine.`);
-  };
-  worker.onmessage = ({ data }) => {
-    if (data.type === "init-error") { engineFailure(`Cannot initialize WASM: ${data.message}. Retry the layout engine.`); return; }
-    if (data.type === "ready") {
-      clearTimeout(workerTimer);
-      ready = true;
-      $("engine-status").textContent = `Graphviz ${data.version} · WASM`;
-      if (active() && !hasErrors()) render();
-      return;
-    }
-    if (data.type !== "result") return;
-    pending = false;
-    clearTimeout(workerTimer);
-    if (data.id !== job) return;
-    $("viewport").setAttribute("aria-busy", "false");
-    if (!data.success) {
-      const message = (data.errors ?? []).map(error => error.message).join("; ");
-      clearCanvas(`Layout failed: ${message || "Graphviz returned no output"}. Try a different layout.`);
-      status("Layout failed. The document remains available in the editor.");
-      return;
-    }
-    try {
-      mountSVG(data.svg);
-      // sfdp always reports the missing triangulation library in the WASM build; layout is unaffected.
-      const warnings = data.errors?.map(error => error.message).filter(message => !message.includes("triangulation library")).join("; ");
-      status(`Rendered in ${Math.round(data.duration)} ms${warnings ? ` · Graphviz: ${warnings}` : ""}`);
-    } catch (error) {
-      clearCanvas(`Cannot display the graph: ${error.message}`);
-      status(`Preview failed: ${error.message}`);
-    }
-  };
-}
 function render() {
   if (!active() || hasErrors()) return;
   const { graph } = active();
   const stats = graphStats(graph);
   const size = previewMode(graph);
-  $("graph-summary").textContent = `${stats.nodes} nodes · ${stats.links} ${graph.hyperedges ? "hyperedges" : "edges"} · ${stats.components} components · ${stats.isolated} isolated${size.mode === "compact" ? " · Large-graph mode: dots only, sfdp layout" : ""}`;
-  showInspector();
+  $("graph-summary").textContent = `${stats.nodes} nodes · ${stats.links} ${graph.hyperedges ? "hyperedges" : "edges"}${size.mode === "compact" ? " · Large graph: dots only" : ""}`;
   if (size.mode === "too-large") {
-    clearCanvas(`This graph has ${size.nodes} layout nodes and ${size.links} connections. In-browser layout supports up to ${MAX_COMPACT_NODES} and ${MAX_COMPACT_LINKS}. Validation, search, the inspector, and DOT export still work.`);
+    clearCanvas(`This graph has ${size.nodes} layout nodes and ${size.links} connections. In-browser layout supports up to ${MAX_COMPACT_NODES} and ${MAX_COMPACT_LINKS}. Validation, the inspector, and DOT export still work.`);
     $("viewport").setAttribute("aria-busy", "false");
     status("Graph exceeds the in-browser layout limit.");
     return;
@@ -333,87 +183,60 @@ function render() {
     status("Valid graph · No nodes to render");
     return;
   }
-  // The WASM engine is only fetched once there is something to draw.
-  if (!worker) startWorker();
-  clearCanvas(ready ? `Laying out ${size.mode === "compact" ? `${size.nodes} nodes in large-graph mode` : "the graph"}…` : "Starting the WASM layout engine…");
+  clearCanvas(engine.ready ? `Laying out ${size.mode === "compact" ? `${size.nodes} nodes in large-graph mode` : "the graph"}…` : "Starting the WASM layout engine…");
   $("viewport").setAttribute("aria-busy", "true");
-  if (!ready) return;
-  if (pending) { startWorker(); return; }
-  const id = ++job;
-  pending = true;
-  const limit = size.mode === "compact" ? 30000 : 12000;
-  workerTimer = setTimeout(() => engineFailure(`Layout exceeded ${limit / 1000} seconds. Choose a simpler graph or a different layout, then retry the engine.`), limit);
-  worker.postMessage({ id, dot: currentDot(), engine: size.mode === "compact" ? "sfdp" : $("layout").value });
+  const compact = size.mode === "compact";
+  engine.layout(++job, currentDot(), compact ? "sfdp" : "dot", compact ? 30000 : 12000);
 }
 function currentDot() {
   const { graph } = active();
-  return toDot(graph, { labels: $("labels").checked, compact: previewMode(graph).mode === "compact" });
+  return toDot(graph, { labels: $("labels").checked, compact: previewMode(graph).mode === "compact", attributes: shownAttributes });
 }
-function mountSVG(markup) {
-  const parsed = new DOMParser().parseFromString(markup, "image/svg+xml");
-  if (parsed.querySelector("parsererror") || parsed.documentElement.localName !== "svg") throw new Error("Graphviz produced invalid SVG.");
-  svg = document.importNode(parsed.documentElement, true);
-  // Only Graphviz's drawing vocabulary is needed; labels never become HTML or links.
-  const allowed = new Set(["svg", "g", "title", "polygon", "path", "ellipse", "text", "polyline", "rect"]);
-  for (const node of [svg, ...svg.querySelectorAll("*")]) {
-    if (!allowed.has(node.localName)) { node.remove(); continue; }
-    for (const attr of [...node.attributes]) if (/^on/i.test(attr.name) || /href$/i.test(attr.name) || attr.name === "style") node.removeAttributeNode(attr);
+// Lists the attributes the active graph uses; ticked ones appear as extra lines in the diagram's labels.
+function buildAttributeMenu() {
+  const box = $("attribute-options");
+  box.replaceChildren();
+  const available = active() ? attributePaths(active().graph) : { node: [], edge: [] };
+  const chosen = shownAttributes.node.length + shownAttributes.edge.length;
+  $("attributes-menu").querySelector("summary").textContent = chosen ? `Attributes (${chosen})` : "Attributes";
+  if (!available.node.length && !available.edge.length) { box.append(element("p", "This graph has no additional attributes.")); return; }
+  for (const [kind, title] of [["node", "Nodes"], ["edge", active().graph.hyperedges ? "Hyperedges" : "Edges"]]) {
+    if (!available[kind].length) continue;
+    const group = element("fieldset");
+    group.append(element("legend", title));
+    for (const path of available[kind]) {
+      const label = element("label", undefined, "checkbox");
+      const input = element("input");
+      input.type = "checkbox";
+      input.checked = shownAttributes[kind].includes(path);
+      input.addEventListener("change", () => {
+        shownAttributes[kind] = input.checked ? [...shownAttributes[kind], path] : shownAttributes[kind].filter(item => item !== path);
+        saveSettings();
+        buildAttributeMenu();
+        box.querySelector(`input[data-path="${CSS.escape(`${kind}:${path}`)}"]`)?.focus();
+        render();
+      });
+      input.dataset.path = `${kind}:${path}`;
+      label.append(input, ` ${path}`);
+      group.append(label);
+    }
+    box.append(group);
   }
-  svg.removeAttribute("width");
-  svg.removeAttribute("height");
-  svg.setAttribute("aria-label", active().graph.label || "Interactive graph preview");
-  $("canvas").replaceChildren(svg);
-  $("preview-message").hidden = true;
-  baseView = svg.getAttribute("viewBox").split(/\s+/).map(Number);
-  for (const group of svg.querySelectorAll(".node, .edge")) {
-    const match = group.id.match(/^([neh])(\d+)/);
-    if (!match) continue;
-    const kind = match[1] === "n" ? "node" : "edge";
-    const index = Number(match[2]);
-    const graph = active().graph;
-    const id = kind === "node" ? Object.keys(graph.nodes)[index] : index;
-    const item = kind === "node" ? graph.nodes[id] : (graph.edges ?? graph.hyperedges)[index];
-    const label = kind === "node" ? `Node: ${item.label ?? id}` : `${graph.hyperedges ? "Hyperedge" : "Edge"}: ${item.label ?? item.relation ?? index + 1}`;
-    group.setAttribute("tabindex", "0");
-    group.setAttribute("role", "button");
-    group.setAttribute("aria-label", label);
-    const title = group.querySelector("title");
-    if (title) title.textContent = label;
-    group.dataset.kind = kind;
-    group.dataset.index = index;
-    const select = event => {
-      if (suppressClick) return;
-      event.stopPropagation();
-      selectItem(kind, id);
-    };
-    group.addEventListener("click", select);
-    group.addEventListener("dblclick", event => { event.stopPropagation(); revealInSource(kind, id, true); });
-    group.addEventListener("keydown", event => {
-      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(event); }
-    });
-  }
-  for (const id of ["zoom-in", "zoom-out", "fit", "export-svg", "export-png"]) $(id).disabled = false;
-  fit();
-  paintSelection();
-  search();
-  attachPanZoom();
+  if (chosen) box.append(button("Clear all", () => { shownAttributes = { node: [], edge: [] }; saveSettings(); buildAttributeMenu(); render(); }));
 }
-function itemPath(kind, id) {
-  const { graph, path } = active();
-  return kind === "node" ? pointer(`${path}/nodes`, id) : `${path}/${graph.edges ? "edges" : "hyperedges"}/${id}`;
-}
+
 function revealInSource(kind, id, focus = false) {
-  const location = analysis.locations.get(itemPath(kind, id));
+  const location = analysis.locations.get(itemPath(active(), kind, id));
   if (!location) return;
   const from = location.keyStart ?? location.start;
   if (focus) editor.select(from, location.end);
   else editor.link({ from, to: location.end });
 }
 function selectItem(kind, id, { fromSource = false } = {}) {
-  selection = { kind, id };
-  paintSelection();
-  showInspector();
-  if (fromSource) editor.link(null);
+  selection = kind ? { kind, id } : null;
+  viewer.paint(selection, diff);
+  inspect();
+  if (!selection || fromSource) editor.link(null);
   else if (editor.value === analyzedText) revealInSource(kind, id);
 }
 // Moving the cursor inside a node or edge in the source selects it in the diagram.
@@ -435,142 +258,7 @@ function selectFromSource(position) {
   if (selection?.kind === best.kind && selection.id === id) return;
   selectItem(best.kind, id, { fromSource: true });
 }
-function paintSelection() {
-  if (!svg || !active()) return;
-  const selectedIndex = selection?.kind === "node" ? Object.keys(active().graph.nodes).indexOf(selection.id) : selection?.id;
-  for (const group of svg.querySelectorAll("[data-kind]")) {
-    const selected = selection && group.dataset.kind === selection.kind && Number(group.dataset.index) === selectedIndex;
-    group.classList.toggle("selected", Boolean(selected));
-    group.setAttribute("aria-pressed", String(Boolean(selected)));
-  }
-}
-function showInspector() {
-  const panel = $("inspector");
-  panel.replaceChildren();
-  $("clear-selection").hidden = !selection;
-  if (!active()) {
-    panel.append(element("h3", "No graph selected"), element("p", "Load a valid JSON Graph document to inspect its structure."));
-    return;
-  }
-  const { graph, path } = active();
-  let data = graph;
-  let location = path;
-  let heading = graph.label || graph.id || `Graph ${current + 1}`;
-  let kind = "Graph overview";
-  if (selection?.kind === "node") {
-    data = graph.nodes[selection.id];
-    location = pointer(`${path}/nodes`, selection.id);
-    heading = data.label ?? selection.id;
-    kind = "Node";
-  } else if (selection?.kind === "edge") {
-    data = (graph.edges ?? graph.hyperedges)[selection.id];
-    location = `${path}/${graph.edges ? "edges" : "hyperedges"}/${selection.id}`;
-    heading = data.label ?? data.relation ?? `${graph.edges ? "Edge" : "Hyperedge"} ${selection.id + 1}`;
-    kind = graph.edges ? "Edge" : "Hyperedge";
-  }
-  panel.append(element("div", kind, "kind"), element("h3", heading));
-  if (selection?.kind === "node") panel.append(element("p", `ID: ${selection.id}`));
-  if (!selection) {
-    const stats = graphStats(graph);
-    const list = element("dl");
-    for (const [label, value] of [["Direction", graph.directed === false ? "Undirected" : "Directed"], ["Nodes", stats.nodes], [graph.hyperedges ? "Hyperedges" : "Edges", stats.links], ["Components", stats.components], ["Isolated nodes", stats.isolated]]) {
-      list.append(element("dt", label), element("dd", value));
-    }
-    panel.append(list);
-  }
-  panel.append(button("Show in source", () => selection ? revealInSource(selection.kind, selection.id, true) : jumpTo(location)));
-  if (selection?.kind === "node") {
-    const links = graph.edges ?? graph.hyperedges ?? [];
-    const connected = links.map((edge, index) => ({ edge, index })).filter(({ edge }) => graph.edges
-      ? edge.source === selection.id || edge.target === selection.id
-      : (edge.nodes ?? [...edge.source, ...edge.target]).includes(selection.id));
-    panel.append(element("h4", `Connections (${connected.length})`));
-    for (const { edge, index } of connected) {
-      const text = graph.edges ? `${edge.source} ${edge.directed ?? graph.directed ?? true ? "→" : "—"} ${edge.target}` : edge.label ?? edge.relation ?? `Hyperedge ${index + 1}`;
-      panel.append(button(text, () => selectItem("edge", index), "connection"));
-    }
-  }
-  panel.append(element("h4", selection ? "Source object" : "Graph metadata"));
-  panel.append(element("pre", JSON.stringify(selection ? data : graph.metadata ?? {}, null, 2)));
-}
-function search() {
-  const query = $("search").value.trim().toLocaleLowerCase();
-  const results = $("search-results");
-  results.replaceChildren();
-  results.hidden = !query;
-  const matches = new Set();
-  if (query && active()) {
-    for (const [index, [id, node]] of Object.entries(active().graph.nodes ?? {}).entries()) {
-      if (`${id} ${node.label ?? ""}`.toLocaleLowerCase().includes(query)) {
-        matches.add(index);
-        const result = button(node.label ?? id, () => selectItem("node", id), "search-result");
-        result.append(element("small", id));
-        results.append(result);
-      }
-    }
-  }
-  if (query && !matches.size) results.append(element("p", "No matching nodes."));
-  if (svg) for (const node of svg.querySelectorAll(".node[data-kind='node']")) {
-    node.classList.toggle("matched", Boolean(query) && matches.has(Number(node.dataset.index)));
-    node.classList.toggle("dimmed", Boolean(query) && !matches.has(Number(node.dataset.index)));
-  }
-}
-function applyView() {
-  if (!svg || !view) return;
-  svg.setAttribute("viewBox", view.join(" "));
-  const zoomLevel = baseView[2] / view[2];
-  $("zoom-level").textContent = `${Math.round(zoomLevel * 100)}%`;
-  $("zoom-out").disabled = zoomLevel <= MIN_ZOOM + 1e-6;
-  $("zoom-in").disabled = zoomLevel >= MAX_ZOOM - 1e-6;
-}
-function fit() { if (baseView) { view = [...baseView]; applyView(); } }
-function zoom(factor, point) {
-  if (!svg || !view) return;
-  const zoomLevel = baseView[2] / view[2];
-  const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoomLevel * factor));
-  // The fitted view is the floor: zooming out further only adds empty space.
-  if (nextZoom <= MIN_ZOOM) { fit(); return; }
-  const ratio = zoomLevel / nextZoom;
-  const center = point ?? { x: view[0] + view[2] / 2, y: view[1] + view[3] / 2 };
-  view = [center.x - (center.x - view[0]) * ratio, center.y - (center.y - view[1]) * ratio, view[2] * ratio, view[3] * ratio];
-  applyView();
-}
-function svgPoint(event) {
-  const point = svg.createSVGPoint();
-  point.x = event.clientX; point.y = event.clientY;
-  return point.matrixTransform(svg.getScreenCTM().inverse());
-}
-function attachPanZoom() {
-  let drag = null;
-  svg.addEventListener("wheel", event => {
-    event.preventDefault();
-    zoom(Math.exp(-Math.max(-100, Math.min(100, event.deltaY)) * .006), svgPoint(event));
-  }, { passive: false });
-  svg.addEventListener("pointerdown", event => {
-    if (event.button !== 0 || event.target.closest("[data-kind]")) return;
-    drag = { start: svgPoint(event), view: [...view], clientX: event.clientX, clientY: event.clientY };
-    svg.setPointerCapture(event.pointerId);
-  });
-  svg.addEventListener("pointermove", event => {
-    if (!drag) return;
-    if (Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) > 3) suppressClick = true;
-    const point = svgPoint(event);
-    view[0] += drag.start.x - point.x;
-    view[1] += drag.start.y - point.y;
-    applyView();
-  });
-  const finish = () => { drag = null; setTimeout(() => { suppressClick = false; }, 0); };
-  svg.addEventListener("pointerup", finish);
-  svg.addEventListener("pointercancel", finish);
-  svg.addEventListener("click", () => { if (!suppressClick) { selection = null; paintSelection(); showInspector(); } });
-}
-function save(content, type, name) {
-  const url = URL.createObjectURL(content instanceof Blob ? content : new Blob([content], { type }));
-  const link = element("a");
-  link.href = url; link.download = name;
-  document.body.append(link); link.click(); link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
+
 function load(text, name, { baseline = text } = {}) {
   clearTimeout(editTimer);
   editor.setValue(text);
@@ -598,44 +286,11 @@ function restore() {
     return true;
   } catch { return false; }
 }
-const PANES = ["source", "preview", "inspector"];
-let hiddenPanes = new Set();
-function applyPanes() {
-  for (const pane of PANES) {
-    const hidden = hiddenPanes.has(pane);
-    $(`${pane}-pane`).classList.toggle("collapsed", hidden);
-    $("workspace").classList.toggle(`hide-${pane}`, hidden);
-    document.querySelector(`.pane-tab[data-pane="${pane}"]`).setAttribute("aria-expanded", String(!hidden));
-  }
-  // Keep at least one pane visible.
-  const last = hiddenPanes.size === PANES.length - 1;
-  for (const button of document.querySelectorAll(".pane-hide")) button.disabled = last && !hiddenPanes.has(button.dataset.pane);
-}
-function setPaneHidden(pane, hidden) {
-  if (hidden && hiddenPanes.size >= PANES.length - 1) return;
-  hiddenPanes[hidden ? "add" : "delete"](pane);
-  applyPanes();
-  saveSettings();
-  if (!hidden) (pane === "source" ? editor.focus() : $(`${pane}-pane`).querySelector(".pane-hide").focus());
-  else document.querySelector(`.pane-tab[data-pane="${pane}"]`).focus();
-}
-for (const button of document.querySelectorAll(".pane-hide")) button.addEventListener("click", () => setPaneHidden(button.dataset.pane, true));
-for (const button of document.querySelectorAll(".pane-tab")) button.addEventListener("click", () => setPaneHidden(button.dataset.pane, false));
-
-function saveSettings() {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify({ layout: $("layout").value, labels: $("labels").checked, details: $("diagnostic-details").checked, hiddenPanes: [...hiddenPanes] })); } catch {}
-}
-function restoreSettings() {
-  try {
-    const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY)) ?? {};
-    if ([...$("layout").options].some(option => option.value === settings.layout)) $("layout").value = settings.layout;
-    if (typeof settings.labels === "boolean") $("labels").checked = settings.labels;
-    if (typeof settings.details === "boolean") $("diagnostic-details").checked = settings.details;
-    if (Array.isArray(settings.hiddenPanes)) hiddenPanes = new Set(settings.hiddenPanes.filter(pane => PANES.includes(pane)).slice(0, PANES.length - 1));
-  } catch {}
-  applyPanes();
+function mayReplace() {
+  return editor.value === lastLoaded || window.confirm("Replace the current document? Save JSON first if you want to keep your changes.");
 }
 function documentEdited() {
+  if (!applyingFix) hideUndo();
   job++;
   clearCanvas("Document changed. Updating the preview…");
   $("viewport").setAttribute("aria-busy", "true");
@@ -643,153 +298,29 @@ function documentEdited() {
   editTimer = setTimeout(update, 350);
   persist();
 }
+function hideUndo() { clearTimeout(undoTimer); $("undo").hidden = true; }
 function applyFix(fix) {
   if (editor.value !== analyzedText) {
     update();
     status("The document changed since it was checked. Diagnostics are refreshed; choose the fix again.");
     return;
   }
-  // Keep documents that were already 2-space formatted that way after the edit.
+  // Keep documents that were already 2-space formatted that way. One edit means one undo step.
   const wasFormatted = analysis.document !== null && analyzedText === JSON.stringify(analysis.document, null, 2);
-  editor.applyEdits(fix.edits);
-  if (wasFormatted) {
-    const fixed = analyzeSource(editor.value);
-    if (fixed.document !== null && !fixed.diagnostics.some(item => item.code === "duplicate-key")) editor.setValue(JSON.stringify(fixed.document, null, 2), { keepHistory: true });
-  }
+  applyingFix = true;
+  try {
+    const fixedText = applyEdits(analyzedText, fix.edits);
+    const fixed = wasFormatted ? analyzeSource(fixedText) : null;
+    if (fixed?.document != null && !fixed.diagnostics.some(item => item.code === "duplicate-key")) editor.setValue(JSON.stringify(fixed.document, null, 2), { silent: false, keepHistory: true });
+    else editor.applyEdits(fix.edits);
+  } finally { applyingFix = false; }
   update();
   persist();
-  status(`Applied: ${fix.label}. Undo with Ctrl or Command + Z.`);
+  status(`Applied: ${fix.label}.`);
+  $("undo").hidden = false;
+  clearTimeout(undoTimer);
+  undoTimer = setTimeout(hideUndo, 15000);
 }
-function mayReplace() {
-  return editor.value === lastLoaded || window.confirm("Replace the current document? Save JSON first if you want to keep your changes.");
-}
-const MAX_FETCH_MS = 20000;
-// GitHub page links return HTML; the raw host serves the file itself with CORS enabled.
-function rawUrl(url) {
-  const blob = url.hostname === "github.com" && url.pathname.match(/^\/([^/]+)\/([^/]+)\/(?:blob|raw)\/(.+)$/);
-  if (blob) return new URL(`https://raw.githubusercontent.com/${blob[1]}/${blob[2]}/${blob[3]}`);
-  const gist = url.hostname === "gist.github.com" && url.pathname.match(/^\/([^/]+)\/([0-9a-f]+)\/?$/i);
-  if (gist) return new URL(`https://gist.githubusercontent.com/${gist[1]}/${gist[2]}/raw`);
-  return url;
-}
-function urlMessage(text, isError = false) {
-  $("url-message").textContent = text;
-  $("url-message").classList.toggle("error", isError);
-}
-async function readLimited(response) {
-  const declared = Number(response.headers.get("content-length"));
-  if (declared > MAX_SOURCE_BYTES) throw new Error(`The document is ${(declared / 1048576).toFixed(1)} MiB; the limit is 2 MiB.`);
-  if (!response.body) return response.text();
-  const reader = response.body.getReader();
-  const chunks = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_SOURCE_BYTES) { reader.cancel(); throw new Error("The document exceeds the 2 MiB limit."); }
-    chunks.push(value);
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return new TextDecoder().decode(bytes);
-}
-async function loadFromUrl(input, { confirmReplace = true } = {}) {
-  let url;
-  try { url = new URL(input.trim(), location.href); } catch { urlMessage("Enter a complete URL, such as https://example.com/graph.json.", true); return false; }
-  if (url.protocol !== "https:" && url.protocol !== "http:") { urlMessage(`Only http and https URLs can be loaded, not ${url.protocol}`, true); return false; }
-  if (location.protocol === "https:" && url.protocol === "http:" && url.hostname !== "localhost") { urlMessage("This page is served over HTTPS, so the browser blocks plain HTTP downloads (mixed content). Use an https:// URL.", true); return false; }
-  const target = rawUrl(url);
-  if (confirmReplace && !mayReplace()) return false;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), MAX_FETCH_MS);
-  $("url-form").setAttribute("aria-busy", "true");
-  $("url-submit").disabled = true;
-  urlMessage(`Fetching ${target.href}${target.href !== url.href ? " (converted to the raw file)" : ""}…`);
-  status(`Fetching ${target.host}…`);
-  try {
-    const response = await fetch(target, { signal: controller.signal, credentials: "omit", redirect: "follow", headers: { Accept: "application/json, text/plain;q=0.9, */*;q=0.5" } });
-    if (!response.ok) throw new Error(`The server answered ${response.status}${response.statusText ? ` ${response.statusText}` : ""}. Check that the URL is correct and publicly readable.`);
-    const type = response.headers.get("content-type") ?? "";
-    if (/text\/html/i.test(type)) throw new Error("The server returned an HTML web page, not JSON. Link to the raw file instead (for GitHub, use the Raw button's URL).");
-    const text = await readLimited(response);
-    const name = decodeURIComponent(target.pathname.split("/").filter(Boolean).pop() || target.hostname) || "remote.json";
-    load(text, name);
-    const share = new URL(location.href);
-    share.search = "";
-    share.searchParams.set("url", url.href);
-    history.replaceState(null, "", share);
-    urlMessage(`Loaded ${plural(text.length, "character")} from ${target.host}. The address bar now links to this document.`);
-    status(`Loaded ${name} from ${target.host}`);
-    $("url-form").hidden = true;
-    $("open-url").setAttribute("aria-expanded", "false");
-    return true;
-  } catch (error) {
-    const message = error.name === "AbortError" ? `No response after ${MAX_FETCH_MS / 1000} seconds. The server may be slow or unreachable.`
-      : error instanceof TypeError ? `The browser could not read ${target.host}. Most often the server does not allow cross-origin requests (CORS), or the host is unreachable. Raw links from GitHub, GitHub Gists, and most static hosts work; otherwise download the file and use Open JSON file.`
-      : error.message;
-    urlMessage(message, true);
-    status(`Could not load the URL: ${message}`);
-    $("url-form").hidden = false;
-    $("open-url").setAttribute("aria-expanded", "true");
-    return false;
-  } finally {
-    clearTimeout(timer);
-    $("url-form").removeAttribute("aria-busy");
-    $("url-submit").disabled = false;
-  }
-}
-function clearSharedUrl() {
-  if (!new URL(location.href).searchParams.has("url")) return;
-  const plain = new URL(location.href);
-  plain.searchParams.delete("url");
-  history.replaceState(null, "", plain);
-}
-$("open-url").addEventListener("click", () => {
-  const open = $("url-form").hidden;
-  $("url-form").hidden = !open;
-  $("open-url").setAttribute("aria-expanded", String(open));
-  if (open) { $("url-input").focus(); $("url-input").select(); }
-});
-$("url-cancel").addEventListener("click", () => { $("url-form").hidden = true; $("open-url").setAttribute("aria-expanded", "false"); $("open-url").focus(); });
-$("url-form").addEventListener("submit", event => { event.preventDefault(); loadFromUrl($("url-input").value); });
-for (const control of document.querySelectorAll("[data-filter]")) control.addEventListener("click", () => { diagnosticFilter = control.dataset.filter; showDiagnostics(); });
-$("diagnostic-details").addEventListener("change", () => $("diagnostics").classList.toggle("compact", !$("diagnostic-details").checked));
-$("expand-diagnostics").addEventListener("click", event => {
-  const expanded = $("source-pane").classList.toggle("diagnostics-expanded");
-  event.currentTarget.setAttribute("aria-pressed", String(expanded));
-  event.currentTarget.textContent = expanded ? "Collapse" : "Expand";
-});
-$("copy-report").addEventListener("click", async () => {
-  try { await navigator.clipboard.writeText(diagnosticReport()); status("Diagnostics report copied to the clipboard."); }
-  catch { save(diagnosticReport(), "text/plain", filename.replace(/\.json$/i, "") + "-diagnostics.txt"); status("Clipboard unavailable; the report was downloaded instead."); }
-});
-$("open").addEventListener("click", () => $("file").click());
-$("file").addEventListener("change", async event => {
-  const file = event.target.files[0];
-  event.target.value = "";
-  if (!file) return;
-  if (!mayReplace()) return;
-  await openFile(file, true);
-});
-async function openFile(file, confirmed = false) {
-  if (file.size > MAX_SOURCE_BYTES) { status("File exceeds the 2 MiB limit. Choose a smaller JSON document."); return; }
-  if (!confirmed && !mayReplace()) return;
-  try { load(await file.text(), file.name); clearSharedUrl(); status(`Opened ${file.name}.`); } catch (error) { status(`Cannot read file: ${error.message}`); }
-}
-for (const [kind, label] of [["valid", "Examples"], ["debug", "Debugging practice"]]) {
-  const group = element("optgroup");
-  group.label = label;
-  for (const item of examples.filter(entry => entry.kind === kind)) group.append(new Option(item.name, item.id));
-  $("example").append(group);
-}
-$("example").addEventListener("change", event => {
-  const item = examples.find(entry => entry.id === event.target.value);
-  event.target.value = "";
-  if (item && mayReplace()) { load(item.text, item.file); clearSharedUrl(); }
-});
-$("format").addEventListener("click", format);
 function format() {
   const parsed = analyzeSource(editor.value);
   if (parsed.diagnostics.some(item => item.code === "duplicate-key") || !parsed.locations.size) {
@@ -801,76 +332,206 @@ function format() {
   update();
   persist();
 }
+
+function applyPanes() {
+  for (const pane of PANES) {
+    const hidden = hiddenPanes.has(pane);
+    $(`${pane}-pane`).classList.toggle("collapsed", hidden);
+    $("workspace").classList.toggle(`hide-${pane}`, hidden);
+    document.querySelector(`.pane-tab[data-pane="${pane}"]`).setAttribute("aria-expanded", String(!hidden));
+  }
+  // Keep at least one pane visible.
+  const last = hiddenPanes.size === PANES.length - 1;
+  for (const control of document.querySelectorAll(".pane-hide")) control.disabled = last && !hiddenPanes.has(control.dataset.pane);
+}
+function setPaneHidden(pane, hidden) {
+  if (hidden && hiddenPanes.size >= PANES.length - 1) return;
+  hiddenPanes[hidden ? "add" : "delete"](pane);
+  applyPanes();
+  saveSettings();
+  if (!hidden) (pane === "source" ? editor.focus() : $(`${pane}-pane`).querySelector(".pane-hide").focus());
+  else document.querySelector(`.pane-tab[data-pane="${pane}"]`).focus();
+}
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify({ labels: $("labels").checked, hiddenPanes: [...hiddenPanes], attributes: shownAttributes })); } catch {}
+}
+function restoreSettings() {
+  try {
+    const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY)) ?? {};
+    if (typeof settings.labels === "boolean") $("labels").checked = settings.labels;
+    for (const kind of ["node", "edge"]) if (Array.isArray(settings.attributes?.[kind])) shownAttributes[kind] = settings.attributes[kind].filter(path => typeof path === "string").slice(0, 20);
+    if (Array.isArray(settings.hiddenPanes)) hiddenPanes = new Set(settings.hiddenPanes.filter(pane => PANES.includes(pane)).slice(0, PANES.length - 1));
+  } catch {}
+  applyPanes();
+}
+
+function urlMessage(text, isError = false) {
+  $("url-message").textContent = text;
+  $("url-message").classList.toggle("error", isError);
+}
+function showUrlForm(show) {
+  $("url-form").hidden = !show;
+  if (show) { $("url-input").focus(); $("url-input").select(); }
+}
+async function loadFromUrl(input, { confirmReplace = true } = {}) {
+  let parsed;
+  try { parsed = parseDocumentUrl(input); } catch (error) { urlMessage(error.message, true); showUrlForm(true); return false; }
+  const { url, target } = parsed;
+  if (confirmReplace && !mayReplace()) return false;
+  $("url-form").setAttribute("aria-busy", "true");
+  $("url-submit").disabled = true;
+  urlMessage(`Fetching ${target.href}${target.href !== url.href ? " (converted to the raw file)" : ""}…`);
+  status(`Fetching ${target.host}…`);
+  try {
+    const { text, name } = await fetchDocument(target);
+    load(text, name);
+    const share = new URL(location.href);
+    share.search = "";
+    share.hash = "";
+    share.searchParams.set("url", url.href);
+    history.replaceState(null, "", share);
+    status(`Loaded ${name} from ${target.host}. The address bar now links to this document.`);
+    showUrlForm(false);
+    return true;
+  } catch (error) {
+    urlMessage(error.message, true);
+    status(`Could not load the URL: ${error.message}`);
+    showUrlForm(true);
+    return false;
+  } finally {
+    $("url-form").removeAttribute("aria-busy");
+    $("url-submit").disabled = false;
+  }
+}
+function clearSharedUrl() {
+  const plain = new URL(location.href);
+  if (!plain.searchParams.has("url") && !plain.hash) return;
+  plain.searchParams.delete("url");
+  plain.hash = "";
+  history.replaceState(null, "", plain);
+}
+async function openFile(file, confirmed = false) {
+  if (file.size > MAX_SOURCE_BYTES) { status("File exceeds the 2 MiB limit. Choose a smaller JSON document."); return; }
+  if (!confirmed && !mayReplace()) return;
+  try { load(await file.text(), file.name); clearSharedUrl(); status(`Opened ${file.name}.`); } catch (error) { status(`Cannot read file: ${error.message}`); }
+}
+async function compareWith(file) {
+  if (file.size > MAX_SOURCE_BYTES) { status("File exceeds the 2 MiB limit."); return; }
+  try {
+    const text = await file.text();
+    JSON.parse(text);
+    comparison = { text, name: file.name };
+    $("changes").checked = true;
+    refreshDiff();
+    status(`Comparing with ${file.name}. Added items are green, changed items amber; removed items are listed in the Inspector.`);
+  } catch (error) { status(`Cannot compare with ${file.name}: ${error.message}`); }
+}
+async function share() {
+  try {
+    const url = new URL(location.href);
+    url.search = "";
+    url.hash = `doc=${await encodeShare(editor.value, filename)}`;
+    const size = url.href.length;
+    try { await navigator.clipboard.writeText(url.href); status(`Share link copied (${Math.ceil(size / 1024)} KB). The document travels in the link; nothing is uploaded.${size > 64000 ? " Long links may be cut off by some apps." : ""}`); }
+    catch { window.prompt("Copy this link:", url.href); }
+  } catch (error) { status(`Cannot create a share link: ${error.message}`); }
+}
+async function openSharedDocument(encoded) {
+  try {
+    const { text, name } = await decodeShare(encoded);
+    if (!mayReplace()) return;
+    load(text, name, { baseline: text });
+    status(`Opened ${name} from a share link.`);
+  } catch (error) {
+    status(`Cannot open the share link: ${error.message}`);
+  } finally {
+    clearSharedUrl();
+  }
+}
+
+// Controls
+for (const control of document.querySelectorAll(".pane-hide")) control.addEventListener("click", () => setPaneHidden(control.dataset.pane, true));
+for (const control of document.querySelectorAll(".pane-tab")) control.addEventListener("click", () => setPaneHidden(control.dataset.pane, false));
+for (const [kind, label] of [["valid", "Examples"], ["debug", "Debugging practice"]]) {
+  const group = element("optgroup");
+  group.label = label;
+  for (const item of examples.filter(entry => entry.kind === kind)) group.append(new Option(item.name, item.id));
+  $("example").append(group);
+}
+$("example").addEventListener("change", event => {
+  const item = examples.find(entry => entry.id === event.target.value);
+  event.target.value = "";
+  if (item && mayReplace()) { load(item.text, item.file); clearSharedUrl(); }
+});
+$("open").addEventListener("change", event => {
+  const choice = event.target.value;
+  event.target.value = "";
+  if (choice === "url") showUrlForm(true);
+  if (choice === "file" || choice === "compare") { fileMode = choice; $("file").click(); }
+});
+$("file").addEventListener("change", async event => {
+  const file = event.target.files[0];
+  event.target.value = "";
+  if (!file) return;
+  if (fileMode === "compare") { compareWith(file); return; }
+  if (mayReplace()) await openFile(file, true);
+});
+$("url-cancel").addEventListener("click", () => { showUrlForm(false); $("open").focus(); });
+$("url-form").addEventListener("submit", event => { event.preventDefault(); loadFromUrl($("url-input").value); });
+$("expand-diagnostics").addEventListener("click", event => {
+  const expanded = $("source-pane").classList.toggle("diagnostics-expanded");
+  event.currentTarget.setAttribute("aria-pressed", String(expanded));
+  event.currentTarget.textContent = expanded ? "Collapse" : "Expand";
+});
+$("copy-report").addEventListener("click", async () => {
+  const report = diagnosticReport(analysis, filename);
+  try { await navigator.clipboard.writeText(report); status("Diagnostics report copied to the clipboard."); }
+  catch { save(report, "text/plain", `${baseName()}-diagnostics.txt`); status("Clipboard unavailable; the report was downloaded instead."); }
+});
+$("format").addEventListener("click", format);
 $("download").addEventListener("click", () => {
   save(editor.value, "application/json", filename);
   lastLoaded = editor.value;
   persist();
+  if (!comparison) refreshDiff();
   status("JSON download prepared.");
 });
-function exportedSvg() {
-  const exported = svg.cloneNode(true);
-  exported.setAttribute("viewBox", baseView.join(" "));
-  exported.setAttribute("width", baseView[2]); exported.setAttribute("height", baseView[3]);
-  exported.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-  for (const node of exported.querySelectorAll("[data-kind]")) {
-    node.removeAttribute("tabindex"); node.removeAttribute("role"); node.removeAttribute("aria-pressed");
-    node.classList.remove("selected", "dimmed", "matched");
-  }
-  return new XMLSerializer().serializeToString(exported);
-}
-const baseName = () => filename.replace(/\.json$/i, "") || "graph";
-$("export-svg").addEventListener("click", () => {
-  if (!svg) return;
-  save(exportedSvg(), "image/svg+xml", `${baseName()}.svg`);
-  status("SVG download prepared.");
-});
-$("export-png").addEventListener("click", async () => {
-  if (!svg) return;
-  const scale = Math.min(2, 16000 / Math.max(baseView[2], baseView[3]));
-  const image = new Image();
-  const url = URL.createObjectURL(new Blob([exportedSvg()], { type: "image/svg+xml" }));
-  try {
-    image.src = url;
-    await image.decode();
-    const canvas = element("canvas");
-    canvas.width = Math.ceil(baseView[2] * scale);
-    canvas.height = Math.ceil(baseView[3] * scale);
-    const context = canvas.getContext("2d");
-    context.fillStyle = "#ffffff";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(image, 0, 0, canvas.width, canvas.height);
-    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
-    if (!blob) throw new Error("the image is too large for this browser");
-    save(blob, "image/png", `${baseName()}.png`);
-    status(`PNG download prepared (${canvas.width} × ${canvas.height}).`);
-  } catch (error) {
-    status(`Cannot create PNG: ${error.message}. Export SVG instead.`);
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-});
-$("export-dot").addEventListener("click", () => {
+$("share").addEventListener("click", share);
+$("undo").addEventListener("click", () => { editor.undo(); hideUndo(); status("Fix undone."); editor.focus(); });
+$("export").addEventListener("change", async event => {
+  const choice = event.target.value;
+  event.target.value = "";
   if (!active() || hasErrors()) return;
-  save(currentDot(), "text/vnd.graphviz", `${baseName()}.dot`);
-  status("Graphviz DOT download prepared.");
+  if (choice === "dot") { save(currentDot(), "text/vnd.graphviz", `${baseName()}.dot`); status("Graphviz DOT download prepared."); return; }
+  if (!viewer.mounted) { status("Wait for the preview to finish, then export again."); return; }
+  if (choice === "svg") { save(viewer.exportedSvg(), "image/svg+xml", `${baseName()}.svg`); status("SVG download prepared."); }
+  if (choice === "png") {
+    try {
+      const { blob, width, height } = await viewer.exportedPng();
+      save(blob, "image/png", `${baseName()}.png`);
+      status(`PNG download prepared (${width} × ${height}).`);
+    } catch (error) { status(`Cannot create PNG: ${error.message}. Export SVG instead.`); }
+  }
 });
-$("graph-select").addEventListener("change", event => {
-  current = Number(event.target.value); selection = null; $("search").value = ""; search(); render();
-});
-$("layout").addEventListener("change", () => { saveSettings(); render(); });
+$("graph-select").addEventListener("change", event => { current = Number(event.target.value); selection = null; diff = computeDiff(); inspect(); buildAttributeMenu(); render(); });
 $("labels").addEventListener("change", () => { saveSettings(); render(); });
-$("clear-selection").addEventListener("click", () => { selection = null; paintSelection(); showInspector(); });
-$("search").addEventListener("input", search);
-$("zoom-in").addEventListener("click", () => zoom(1.25));
-$("zoom-out").addEventListener("click", () => zoom(.8));
-$("fit").addEventListener("click", fit);
-$("retry-engine").addEventListener("click", startWorker);
+$("changes").addEventListener("change", () => {
+  if (!$("changes").checked) comparison = null;
+  refreshDiff();
+  if ($("changes").checked) status(comparison ? `Comparing with ${comparison.name}.` : lastLoaded ? "Highlighting changes since this document was opened or saved." : "No opened or saved version to compare with. Use Open › Compare with file.");
+});
+$("clear-selection").addEventListener("click", () => selectItem(null));
+$("zoom-in").addEventListener("click", () => viewer.zoom(1.25));
+$("zoom-out").addEventListener("click", () => viewer.zoom(.8));
+$("fit").addEventListener("click", () => viewer.fit());
+$("retry-engine").addEventListener("click", () => { engine.start(); });
 document.addEventListener("keydown", event => {
   if (event.defaultPrevented) return;
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); update(); }
   if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "f") { event.preventDefault(); format(); }
-  if (event.key === "Escape") { selection = null; paintSelection(); showInspector(); }
+  if (event.key === "Escape") { if ($("attributes-menu").open) { $("attributes-menu").open = false; $("attributes-menu").querySelector("summary").focus(); } else selectItem(null); }
 });
+document.addEventListener("click", event => { if (!event.target.closest("#attributes-menu")) $("attributes-menu").open = false; });
 // Drop a JSON file, or a link dragged from another tab, anywhere on the page.
 let dragDepth = 0;
 const dragHasData = event => [...event.dataTransfer.types].some(type => type === "Files" || type === "text/uri-list");
@@ -887,16 +548,23 @@ window.addEventListener("drop", async event => {
   const link = event.dataTransfer.getData("text/uri-list").split("\n").find(line => line && !line.startsWith("#"));
   if (link) { $("url-input").value = link.trim(); loadFromUrl(link.trim()); }
 });
-$("diagnostic-details").addEventListener("change", saveSettings);
 
+// Startup
 restoreSettings();
-const sharedUrl = new URL(location.href).searchParams.get("url");
+const page = new URL(location.href);
+const sharedUrl = page.searchParams.get("url");
+const sharedDoc = page.hash.match(/^#doc=([\w-]+)$/)?.[1];
 if (!restore()) load(examples[0].text, examples[0].file);
-// A shared ?url= link still asks before replacing unsaved work restored from this browser.
-if (sharedUrl) { $("url-input").value = sharedUrl; loadFromUrl(sharedUrl); }
+// Shared links still ask before replacing unsaved work restored from this browser.
+if (sharedDoc) openSharedDocument(sharedDoc);
+else if (sharedUrl) { $("url-input").value = sharedUrl; loadFromUrl(sharedUrl); }
 
 const deployed = document.querySelector("#deployed time");
 if (deployed) {
   deployed.title = deployed.textContent;
   deployed.textContent = new Date(deployed.dateTime).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+// Works offline after the first visit. Network first, so a new deployment is picked up on the next load.
+if ("serviceWorker" in navigator && (location.protocol === "https:" || ["localhost", "127.0.0.1"].includes(location.hostname))) {
+  navigator.serviceWorker.register("./sw.js").catch(() => {});
 }

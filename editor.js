@@ -1,5 +1,6 @@
 // CodeMirror 6 wrapper. Bundled to dist/vendor/editor.js by build.mjs (esbuild).
 import { basicSetup } from "codemirror";
+import { undo } from "@codemirror/commands";
 import { EditorView, keymap, Decoration } from "@codemirror/view";
 import { EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
 import { json } from "@codemirror/lang-json";
@@ -108,6 +109,7 @@ export function createEditor(parent, hooks) {
         actions: (item.fixes ?? []).map(fix => ({ name: fix.label, apply: () => hooks.onFix(fix) }))
       }))));
     },
+    undo() { return undo(view); },
     focus() { view.focus(); },
     cursor() { return cursorInfo(view.state); }
   };
