@@ -4,7 +4,7 @@ import Ajv from "ajv";
 import { instance } from "@viz-js/viz";
 import schema from "../schema/json-graph-schema_v2.json" with { type: "json" };
 import { analyzeSource, applyEdits, convertV1, getGraphs, graphStats, layoutSize, previewMode, toDot, pointer } from "../graph.js";
-import { example } from "../example.js";
+import { example, examples } from "../example.js";
 
 const json = value => JSON.stringify(value, null, 2);
 const analyze = value => analyzeSource(typeof value === "string" ? value : json(value));
@@ -137,4 +137,26 @@ test("DOT output escapes labels, keeps hyperedge direction, and renders with Gra
   for (const [dot, engine] of [[full, "dot"], [toDot(example.graph), "dot"], [compact, "sfdp"]]) {
     assert.equal(viz.render(dot, { format: "svg", engine }).status, "success");
   }
+});
+
+test("every example loads as described", async () => {
+  const viz = await instance();
+  assert.equal(new Set(examples.map(item => item.id)).size, examples.length);
+  for (const item of examples) {
+    const result = analyzeSource(item.text);
+    if (item.kind === "valid") {
+      assert.deepEqual(errors(result), [], item.id);
+      for (const { graph } of getGraphs(result.document)) {
+        const { mode } = previewMode(graph);
+        assert.notEqual(mode, "too-large", item.id);
+        assert.equal(viz.render(toDot(graph, { compact: mode === "compact" }), { format: "svg", engine: mode === "compact" ? "sfdp" : "dot" }).status, "success", item.id);
+      }
+    } else {
+      assert.ok(errors(result).length, item.id);
+      assert.ok(result.diagnostics.some(diagnostic => diagnostic.fixes?.length), item.id);
+    }
+  }
+  assert.equal(previewMode(analyzeSource(examples.find(item => item.id === "large").text).document.graph).mode, "compact");
+  const broken = examples.find(item => item.id === "broken").text;
+  assert.deepEqual(errors(analyzeSource(applyAll(broken, 20))), []);
 });

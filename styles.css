@@ -141,6 +141,21 @@ input[type="search"] { width: 100%; }
   #canvas .edge:is(:hover, :focus, .selected) path { stroke: var(--accent); }
 }
 
+/* Desktop panes can be hidden; a hidden pane leaves a narrow tab that shows it again. */
+.pane-hide, .pane-tab { display: none; }
+.pane-heading > h2 { margin-right: auto; }
+@media (min-width: 1151px) {
+  .workspace { display: flex; }
+  .source-pane { flex: 0 0 max(300px, 32%); }
+  .preview-pane { flex: 1 1 360px; min-width: 360px; }
+  .inspector-pane { flex: 0 0 280px; }
+  .workspace.hide-preview .source-pane, .workspace.hide-preview.hide-source .inspector-pane { flex: 1 1 auto; }
+  .pane-hide { display: inline-block; }
+  .collapsed { display: none !important; }
+  .collapsed + .pane-tab { display: block; flex: 0 0 auto; padding: 12px 4px; writing-mode: vertical-rl; border: 0; border-inline: 1px solid var(--rule); background: var(--soft); color: inherit; cursor: pointer; }
+  .collapsed + .pane-tab:hover, .collapsed + .pane-tab:focus-visible { color: var(--accent); }
+  .workspace > .pane-tab:first-of-type { border-left: 0; }
+}
 @media (max-width: 1150px) {
   body { height: auto; min-height: 0; }
   .workspace { grid-template-columns: minmax(280px, 38%) 1fr; }

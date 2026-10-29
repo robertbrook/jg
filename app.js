@@ -1,6 +1,6 @@
 import { analyzeSource, applyEdits, getGraphs, graphStats, humanPath, previewMode, toDot, pointer, SCHEMA, MAX_SOURCE_BYTES, MAX_LAYOUT_NODES, MAX_LAYOUT_LINKS, MAX_COMPACT_NODES, MAX_COMPACT_LINKS } from "./graph.js";
 import { createEditor } from "./vendor/editor.js";
-import { example } from "./example.js";
+import { examples } from "./example.js";
 
 const $ = id => document.getElementById(id);
 let analysis;
@@ -307,7 +307,7 @@ function startWorker() {
       mountSVG(data.svg);
       // sfdp always reports the missing triangulation library in the WASM build; layout is unaffected.
       const warnings = data.errors?.map(error => error.message).filter(message => !message.includes("triangulation library")).join("; ");
-      status(`Rendered in ${Math.round(data.duration)} ms${warnings ? ` · Graphviz: ${warnings}` : " · All processing stays in this browser"}`);
+      status(`Rendered in ${Math.round(data.duration)} ms${warnings ? ` · Graphviz: ${warnings}` : ""}`);
     } catch (error) {
       clearCanvas(`Cannot display the graph: ${error.message}`);
       status(`Preview failed: ${error.message}`);
@@ -598,8 +598,32 @@ function restore() {
     return true;
   } catch { return false; }
 }
+const PANES = ["source", "preview", "inspector"];
+let hiddenPanes = new Set();
+function applyPanes() {
+  for (const pane of PANES) {
+    const hidden = hiddenPanes.has(pane);
+    $(`${pane}-pane`).classList.toggle("collapsed", hidden);
+    $("workspace").classList.toggle(`hide-${pane}`, hidden);
+    document.querySelector(`.pane-tab[data-pane="${pane}"]`).setAttribute("aria-expanded", String(!hidden));
+  }
+  // Keep at least one pane visible.
+  const last = hiddenPanes.size === PANES.length - 1;
+  for (const button of document.querySelectorAll(".pane-hide")) button.disabled = last && !hiddenPanes.has(button.dataset.pane);
+}
+function setPaneHidden(pane, hidden) {
+  if (hidden && hiddenPanes.size >= PANES.length - 1) return;
+  hiddenPanes[hidden ? "add" : "delete"](pane);
+  applyPanes();
+  saveSettings();
+  if (!hidden) (pane === "source" ? editor.focus() : $(`${pane}-pane`).querySelector(".pane-hide").focus());
+  else document.querySelector(`.pane-tab[data-pane="${pane}"]`).focus();
+}
+for (const button of document.querySelectorAll(".pane-hide")) button.addEventListener("click", () => setPaneHidden(button.dataset.pane, true));
+for (const button of document.querySelectorAll(".pane-tab")) button.addEventListener("click", () => setPaneHidden(button.dataset.pane, false));
+
 function saveSettings() {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify({ layout: $("layout").value, labels: $("labels").checked, details: $("diagnostic-details").checked })); } catch {}
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify({ layout: $("layout").value, labels: $("labels").checked, details: $("diagnostic-details").checked, hiddenPanes: [...hiddenPanes] })); } catch {}
 }
 function restoreSettings() {
   try {
@@ -607,7 +631,9 @@ function restoreSettings() {
     if ([...$("layout").options].some(option => option.value === settings.layout)) $("layout").value = settings.layout;
     if (typeof settings.labels === "boolean") $("labels").checked = settings.labels;
     if (typeof settings.details === "boolean") $("diagnostic-details").checked = settings.details;
+    if (Array.isArray(settings.hiddenPanes)) hiddenPanes = new Set(settings.hiddenPanes.filter(pane => PANES.includes(pane)).slice(0, PANES.length - 1));
   } catch {}
+  applyPanes();
 }
 function documentEdited() {
   job++;
@@ -752,7 +778,17 @@ async function openFile(file, confirmed = false) {
   if (!confirmed && !mayReplace()) return;
   try { load(await file.text(), file.name); clearSharedUrl(); status(`Opened ${file.name}.`); } catch (error) { status(`Cannot read file: ${error.message}`); }
 }
-$("example").addEventListener("click", () => { if (mayReplace()) { load(JSON.stringify(example, null, 2), "example.json"); clearSharedUrl(); } });
+for (const [kind, label] of [["valid", "Examples"], ["debug", "Debugging practice"]]) {
+  const group = element("optgroup");
+  group.label = label;
+  for (const item of examples.filter(entry => entry.kind === kind)) group.append(new Option(item.name, item.id));
+  $("example").append(group);
+}
+$("example").addEventListener("change", event => {
+  const item = examples.find(entry => entry.id === event.target.value);
+  event.target.value = "";
+  if (item && mayReplace()) { load(item.text, item.file); clearSharedUrl(); }
+});
 $("format").addEventListener("click", format);
 function format() {
   const parsed = analyzeSource(editor.value);
@@ -855,7 +891,7 @@ $("diagnostic-details").addEventListener("change", saveSettings);
 
 restoreSettings();
 const sharedUrl = new URL(location.href).searchParams.get("url");
-if (!restore()) load(JSON.stringify(example, null, 2), "example.json");
+if (!restore()) load(examples[0].text, examples[0].file);
 // A shared ?url= link still asks before replacing unsaved work restored from this browser.
 if (sharedUrl) { $("url-input").value = sharedUrl; loadFromUrl(sharedUrl); }
 
