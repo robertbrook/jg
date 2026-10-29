@@ -1,9 +1,10 @@
-import { analyzeSource, getGraphs, graphStats, layoutSize, toDot, pointer, MAX_SOURCE_BYTES, MAX_LAYOUT_NODES, MAX_LAYOUT_LINKS } from "./graph.js";
+import { analyzeSource, applyEdits, getGraphs, graphStats, humanPath, previewMode, toDot, pointer, SCHEMA, MAX_SOURCE_BYTES, MAX_LAYOUT_NODES, MAX_LAYOUT_LINKS, MAX_COMPACT_NODES, MAX_COMPACT_LINKS } from "./graph.js";
+import { createEditor } from "./vendor/editor.js";
 import { example } from "./example.js";
 
 const $ = id => document.getElementById(id);
-const source = $("source");
 let analysis;
+let analyzedText = "";
 let entries = [];
 let current = 0;
 let selection = null;
@@ -19,6 +20,8 @@ let view = null;
 let lastLoaded = "";
 let filename = "example.json";
 let suppressClick = false;
+const MIN_ZOOM = 1;
+const MAX_ZOOM = 8;
 const active = () => entries[current];
 const hasErrors = () => analysis?.diagnostics.some(item => item.severity === "error");
 const element = (tag, text, className) => {
@@ -35,48 +38,171 @@ const button = (text, action, className) => {
 };
 const status = message => { $("status").textContent = message; };
 
-function updateCursor() {
-  const before = source.value.slice(0, source.selectionStart);
-  const lines = before.split("\n");
-  $("cursor").textContent = `Ln ${lines.length}, Col ${lines.at(-1).length + 1}`;
-}
-function updateLines() {
-  const count = source.value.split("\n").length;
-  $("line-numbers").textContent = Array.from({ length: count }, (_, index) => index + 1).join("\n");
-  $("line-numbers").scrollTop = source.scrollTop;
-  updateCursor();
-}
-function jumpTo(path, start) {
+const STORAGE_KEY = `jg:document:${location.pathname}`;
+const SETTINGS_KEY = "jg:settings";
+let saveTimer;
+let cursorTimer;
+const editor = createEditor($("editor"), {
+  label: "JSON Graph document",
+  onChange: documentEdited,
+  onCursor: (info, byUser) => {
+    $("cursor").textContent = `Ln ${info.line}, Col ${info.column}`;
+    clearTimeout(cursorTimer);
+    if (byUser) cursorTimer = setTimeout(() => selectFromSource(info.position), 120);
+  },
+  onRun: () => update(),
+  onFormat: () => format(),
+  onFix: fix => applyFix(fix)
+});
+function jumpTo(path, start, length = 0) {
   let location = analysis?.locations.get(path);
   while (!location && path) {
     path = path.slice(0, path.lastIndexOf("/"));
     location = analysis?.locations.get(path);
   }
-  const from = start ?? location?.start ?? 0;
-  const to = start === undefined ? location?.end ?? from : Math.min(from + 1, source.value.length);
-  source.focus();
-  source.setSelectionRange(from, to);
-  const line = source.value.slice(0, from).split("\n").length - 1;
-  source.scrollTop = Math.max(0, line * parseFloat(getComputedStyle(source).lineHeight) - source.clientHeight / 3);
-  $("line-numbers").scrollTop = source.scrollTop;
-  updateCursor();
+  const from = start ?? location?.keyStart ?? location?.start ?? 0;
+  const to = start === undefined ? location?.end ?? from : from + Math.max(1, length);
+  editor.select(from, to);
+}
+const SEVERITY_LABEL = { error: "Error", warning: "Warning", info: "Info" };
+const MAX_RENDERED_DIAGNOSTICS = 200;
+let diagnosticFilter = "all";
+const plural = (count, word, many = `${word}s`) => `${count} ${count === 1 ? word : many}`;
+const severityCounts = () => {
+  const counts = { all: analysis.diagnostics.length, error: 0, warning: 0, info: 0 };
+  for (const item of analysis.diagnostics) counts[item.severity]++;
+  return counts;
+};
+function schemaState() {
+  const { summary } = analysis;
+  if (summary.schema === "not-run") return ["state-invalid", "Not run — the JSON must parse first"];
+  if (summary.schema === "valid") return ["state-valid", "Valid"];
+  if (summary.schema === "ambiguous") return ["state-ambiguous", "Accepted here; strict draft-07 validators reject (ambiguous oneOf)"];
+  return ["state-invalid", `Invalid · ${plural(summary.schemaErrors, "violation")}`];
+}
+function excerpt(diagnostic) {
+  if (!diagnostic.line) return null;
+  const lines = analyzedText.split("\n");
+  const index = diagnostic.line - 1;
+  if (index >= lines.length) return null;
+  const width = String(Math.min(lines.length, index + 2)).length;
+  const column = Math.max(0, (diagnostic.column ?? 1) - 1);
+  // Keep very long lines readable by windowing around the column.
+  const offset = Math.max(0, Math.min(column - 30, lines[index].length - 90));
+  const clip = text => {
+    const slice = text.slice(offset, offset + 100);
+    return (offset ? "…" : "") + slice + (text.length > offset + 100 ? "…" : "");
+  };
+  const block = element("pre", undefined, "excerpt");
+  if (index > 0) block.append(`${String(index).padStart(width)} │ ${clip(lines[index - 1])}\n`);
+  block.append(`${String(index + 1).padStart(width)} │ ${clip(lines[index])}\n`);
+  const span = Math.max(1, Math.min(diagnostic.length || 1, lines[index].length - column || 1, 60));
+  block.append(element("span", `${" ".repeat(width)} │ ${" ".repeat(column - offset + (offset ? 1 : 0))}${"^".repeat(span)}`, "caret"));
+  if (index + 1 < lines.length) block.append(`\n${String(index + 2).padStart(width)} │ ${clip(lines[index + 1])}`);
+  return block;
+}
+function detailRows(diagnostic) {
+  return [
+    ["Expected", diagnostic.expected],
+    ["Found", diagnostic.found],
+    ["Path", diagnostic.path !== undefined ? humanPath(diagnostic.path, analysis.document) : undefined],
+    ["JSON pointer", diagnostic.path !== undefined ? diagnostic.path || "(root)" : undefined],
+    ["Schema rule", diagnostic.schemaPath],
+    ["Code", diagnostic.code]
+  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
+}
+function renderDiagnostic(diagnostic) {
+  const item = element("article", undefined, `diagnostic ${diagnostic.severity}`);
+  const head = element("div", undefined, "diagnostic-head");
+  head.append(element("span", SEVERITY_LABEL[diagnostic.severity], "badge"), element("span", [diagnostic.category, diagnostic.keyword].filter(Boolean).join(" · "), "diagnostic-meta"));
+  const title = button(diagnostic.title ?? diagnostic.message, () => jumpTo(diagnostic.path, diagnostic.start, diagnostic.length), "diagnostic-title");
+  title.title = "Jump to this location in the document";
+  if (diagnostic.line) title.append(element("span", `Ln ${diagnostic.line}, Col ${diagnostic.column}`, "position"));
+  item.append(head, title);
+  if (diagnostic.title && diagnostic.message) item.append(element("p", diagnostic.message));
+  if (diagnostic.hint) {
+    const hint = element("p", undefined, "hint");
+    hint.append(element("strong", "Fix: "), diagnostic.hint);
+    item.append(hint);
+  }
+  if (diagnostic.fixes?.length) {
+    const actions = element("div", undefined, "fix-actions");
+    for (const fix of diagnostic.fixes) actions.append(button(fix.label, () => applyFix(fix), "fix"));
+    item.append(actions);
+  }
+  const rows = detailRows(diagnostic);
+  if (rows.length) {
+    const list = element("dl", undefined, "diagnostic-details");
+    for (const [term, value] of rows) list.append(element("dt", term), element("dd", value));
+    item.append(list);
+  }
+  for (const step of diagnostic.context ?? []) {
+    const box = element("div", undefined, "diagnostic-context");
+    box.append(element("p", `At ${step.at}, the schema offers ${step.count} alternatives (oneOf). Checked against the closest: ${step.chosen}.`));
+    if (step.alternatives?.length) {
+      const others = element("ul");
+      for (const alternative of step.alternatives) others.append(element("li", `${alternative.label} — ${alternative.reason}`));
+      box.append(others);
+    }
+    item.append(box);
+  }
+  const snippet = excerpt(diagnostic);
+  if (snippet) item.append(snippet);
+  return item;
 }
 function showDiagnostics() {
   const list = $("diagnostics");
+  const counts = severityCounts();
+  const { summary } = analysis;
+  $("diagnostic-count").textContent = counts.all ? [plural(counts.error, "error"), plural(counts.warning, "warning"), counts.info ? `${counts.info} info` : ""].filter(Boolean).join(" · ") : "No issues";
+  for (const control of document.querySelectorAll("[data-filter]")) {
+    control.querySelector("span").textContent = counts[control.dataset.filter];
+    control.setAttribute("aria-pressed", String(control.dataset.filter === diagnosticFilter));
+  }
+  const [stateClass, stateText] = schemaState();
+  const summaryList = element("dl", undefined, "diagnostic-summary");
+  summaryList.replaceChildren(
+    element("dt", "Schema"), element("dd", [SCHEMA.file, SCHEMA.dialect, SCHEMA.id].filter(Boolean).join(" · ")),
+    element("dt", "Result"), element("dd", stateText, stateClass),
+    element("dt", "Contents"), element("dd", `${plural(summary.graphs, "graph")} · ${plural(summary.nodes, "node")} · ${plural(summary.links, "edge or hyperedge", "edges and hyperedges")}`),
+    element("dt", "Checks"), element("dd", `Syntax, duplicate keys, schema, node references, and graph semantics · ${summary.ms.toFixed(1)} ms`)
+  );
+  $("diagnostic-summary").replaceWith(summaryList);
+  summaryList.id = "diagnostic-summary";
+  list.classList.toggle("compact", !$("diagnostic-details").checked);
   list.replaceChildren();
-  const errors = analysis.diagnostics.filter(item => item.severity === "error").length;
-  const warnings = analysis.diagnostics.length - errors;
-  $("diagnostic-count").textContent = errors || warnings ? `${errors} errors · ${warnings} warnings` : "No issues";
-  if (!analysis.diagnostics.length) {
-    const healthy = element("div", "Document checks passed", "healthy");
-    healthy.append(element("small", "Structure, field types, and node references are valid."));
+  if (!counts.all) {
+    const healthy = element("div", "All checks passed", "healthy");
+    healthy.append(element("small", "The document is valid JSON Graph v2: it matches the official schema, has no duplicate keys, and every edge and hyperedge references a defined node."));
     list.append(healthy);
+    return;
   }
-  for (const diagnostic of analysis.diagnostics) {
-    const item = button("", () => jumpTo(diagnostic.path, diagnostic.start), `diagnostic ${diagnostic.severity}`);
-    item.append(element("strong", diagnostic.severity === "error" ? "Error · " : "Warning · "), document.createTextNode(diagnostic.message), element("code", diagnostic.path || "/"));
-    list.append(item);
-  }
+  const shown = analysis.diagnostics.filter(item => diagnosticFilter === "all" || item.severity === diagnosticFilter);
+  if (!shown.length) list.append(element("p", `No ${diagnosticFilter === "info" ? "info" : `${diagnosticFilter}s`} in this document.`, "diagnostics-more"));
+  for (const diagnostic of shown.slice(0, MAX_RENDERED_DIAGNOSTICS)) list.append(renderDiagnostic(diagnostic));
+  if (shown.length > MAX_RENDERED_DIAGNOSTICS) list.append(element("p", `Showing the first ${MAX_RENDERED_DIAGNOSTICS} of ${shown.length}. Copy the report to see all of them.`, "diagnostics-more"));
+}
+function diagnosticReport() {
+  const counts = severityCounts();
+  const lines = [
+    `JSON Graph diagnostics — ${filename}`,
+    `Schema: ${SCHEMA.file} (${SCHEMA.dialect}) — ${schemaState()[1]}`,
+    `Totals: ${plural(counts.error, "error")}, ${plural(counts.warning, "warning")}, ${counts.info} info`,
+    ""
+  ];
+  analysis.diagnostics.forEach((diagnostic, index) => {
+    lines.push(`${index + 1}. [${SEVERITY_LABEL[diagnostic.severity]}] ${diagnostic.title ?? diagnostic.message}${diagnostic.line ? ` (Ln ${diagnostic.line}, Col ${diagnostic.column})` : ""}`);
+    if (diagnostic.title && diagnostic.message) lines.push(`   ${diagnostic.message}`);
+    for (const [term, value] of detailRows(diagnostic)) lines.push(`   ${term}: ${value}`);
+    for (const step of diagnostic.context ?? []) {
+      lines.push(`   oneOf at ${step.at}: closest is ${step.chosen}`);
+      for (const alternative of step.alternatives ?? []) lines.push(`     – ${alternative.label}: ${alternative.reason}`);
+    }
+    if (diagnostic.hint) lines.push(`   Fix: ${diagnostic.hint}`);
+    for (const fix of diagnostic.fixes ?? []) lines.push(`   Quick fix available: ${fix.label}`);
+    lines.push("");
+  });
+  return lines.join("\n");
 }
 function clearCanvas(message) {
   svg = null;
@@ -85,15 +211,17 @@ function clearCanvas(message) {
   $("canvas").replaceChildren();
   $("preview-message").textContent = message;
   $("preview-message").hidden = !message;
-  $("export").disabled = true;
-  for (const id of ["zoom-in", "zoom-out", "fit"]) $(id).disabled = true;
+  for (const id of ["zoom-in", "zoom-out", "fit", "export-svg", "export-png"]) $(id).disabled = true;
   $("zoom-level").textContent = "—";
 }
 function update() {
   clearTimeout(editTimer);
   job++;
   selection = null;
-  analysis = analyzeSource(source.value);
+  analyzedText = editor.value;
+  analysis = analyzeSource(analyzedText);
+  editor.setDiagnostics(analysis.diagnostics.map(item => ({ from: item.start, to: item.start + item.length, severity: item.severity, message: [item.title, item.message, item.hint && `Fix: ${item.hint}`].filter(Boolean).join("\n"), fixes: item.fixes })));
+  editor.link(null);
   entries = hasErrors() ? [] : getGraphs(analysis.document);
   current = Math.min(current, Math.max(0, entries.length - 1));
   $("graph-select").replaceChildren();
@@ -107,8 +235,8 @@ function update() {
   $("graph-select").disabled = !entries.length;
   $("search").value = "";
   showDiagnostics();
-  updateLines();
   showInspector();
+  $("export-dot").disabled = !active();
   search();
   if (hasErrors()) {
     clearCanvas("The document needs attention. Select a diagnostic to jump to its source.");
@@ -177,7 +305,8 @@ function startWorker() {
     }
     try {
       mountSVG(data.svg);
-      const warnings = data.errors?.map(error => error.message).join("; ");
+      // sfdp always reports the missing triangulation library in the WASM build; layout is unaffected.
+      const warnings = data.errors?.map(error => error.message).filter(message => !message.includes("triangulation library")).join("; ");
       status(`Rendered in ${Math.round(data.duration)} ms${warnings ? ` · Graphviz: ${warnings}` : " · All processing stays in this browser"}`);
     } catch (error) {
       clearCanvas(`Cannot display the graph: ${error.message}`);
@@ -189,13 +318,13 @@ function render() {
   if (!active() || hasErrors()) return;
   const { graph } = active();
   const stats = graphStats(graph);
-  $("graph-summary").textContent = `${stats.nodes} nodes · ${stats.links} ${graph.hyperedges ? "hyperedges" : "edges"} · ${stats.components} components · ${stats.isolated} isolated`;
+  const size = previewMode(graph);
+  $("graph-summary").textContent = `${stats.nodes} nodes · ${stats.links} ${graph.hyperedges ? "hyperedges" : "edges"} · ${stats.components} components · ${stats.isolated} isolated${size.mode === "compact" ? " · Large-graph mode: dots only, sfdp layout" : ""}`;
   showInspector();
-  const size = layoutSize(graph);
-  if (size.nodes > MAX_LAYOUT_NODES || size.links > MAX_LAYOUT_LINKS) {
-    clearCanvas(`Preview limit: ${MAX_LAYOUT_NODES} layout nodes and ${MAX_LAYOUT_LINKS} connections. This graph has ${size.nodes} and ${size.links}. Reduce it to preview; validation and source editing remain available.`);
+  if (size.mode === "too-large") {
+    clearCanvas(`This graph has ${size.nodes} layout nodes and ${size.links} connections. In-browser layout supports up to ${MAX_COMPACT_NODES} and ${MAX_COMPACT_LINKS}. Validation, search, the inspector, and DOT export still work.`);
     $("viewport").setAttribute("aria-busy", "false");
-    status("Graph exceeds the interactive preview limit.");
+    status("Graph exceeds the in-browser layout limit.");
     return;
   }
   if (!stats.nodes) {
@@ -204,14 +333,21 @@ function render() {
     status("Valid graph · No nodes to render");
     return;
   }
-  clearCanvas(ready ? "Laying out the graph…" : "Waiting for the WASM layout engine…");
+  // The WASM engine is only fetched once there is something to draw.
+  if (!worker) startWorker();
+  clearCanvas(ready ? `Laying out ${size.mode === "compact" ? `${size.nodes} nodes in large-graph mode` : "the graph"}…` : "Starting the WASM layout engine…");
   $("viewport").setAttribute("aria-busy", "true");
   if (!ready) return;
   if (pending) { startWorker(); return; }
   const id = ++job;
   pending = true;
-  workerTimer = setTimeout(() => engineFailure("Layout exceeded 12 seconds. Choose a simpler graph or a different layout, then retry the engine."), 12000);
-  worker.postMessage({ id, dot: toDot(graph, $("labels").checked), engine: $("layout").value });
+  const limit = size.mode === "compact" ? 30000 : 12000;
+  workerTimer = setTimeout(() => engineFailure(`Layout exceeded ${limit / 1000} seconds. Choose a simpler graph or a different layout, then retry the engine.`), limit);
+  worker.postMessage({ id, dot: currentDot(), engine: size.mode === "compact" ? "sfdp" : $("layout").value });
+}
+function currentDot() {
+  const { graph } = active();
+  return toDot(graph, { labels: $("labels").checked, compact: previewMode(graph).mode === "compact" });
 }
 function mountSVG(markup) {
   const parsed = new DOMParser().parseFromString(markup, "image/svg+xml");
@@ -241,6 +377,8 @@ function mountSVG(markup) {
     group.setAttribute("tabindex", "0");
     group.setAttribute("role", "button");
     group.setAttribute("aria-label", label);
+    const title = group.querySelector("title");
+    if (title) title.textContent = label;
     group.dataset.kind = kind;
     group.dataset.index = index;
     const select = event => {
@@ -249,21 +387,53 @@ function mountSVG(markup) {
       selectItem(kind, id);
     };
     group.addEventListener("click", select);
+    group.addEventListener("dblclick", event => { event.stopPropagation(); revealInSource(kind, id, true); });
     group.addEventListener("keydown", event => {
       if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(event); }
     });
   }
-  for (const id of ["zoom-in", "zoom-out", "fit"]) $(id).disabled = false;
-  $("export").disabled = false;
+  for (const id of ["zoom-in", "zoom-out", "fit", "export-svg", "export-png"]) $(id).disabled = false;
   fit();
   paintSelection();
   search();
   attachPanZoom();
 }
-function selectItem(kind, id) {
+function itemPath(kind, id) {
+  const { graph, path } = active();
+  return kind === "node" ? pointer(`${path}/nodes`, id) : `${path}/${graph.edges ? "edges" : "hyperedges"}/${id}`;
+}
+function revealInSource(kind, id, focus = false) {
+  const location = analysis.locations.get(itemPath(kind, id));
+  if (!location) return;
+  const from = location.keyStart ?? location.start;
+  if (focus) editor.select(from, location.end);
+  else editor.link({ from, to: location.end });
+}
+function selectItem(kind, id, { fromSource = false } = {}) {
   selection = { kind, id };
   paintSelection();
   showInspector();
+  if (fromSource) editor.link(null);
+  else if (editor.value === analyzedText) revealInSource(kind, id);
+}
+// Moving the cursor inside a node or edge in the source selects it in the diagram.
+function selectFromSource(position) {
+  if (!active() || hasErrors() || editor.value !== analyzedText) return;
+  const { graph, path } = active();
+  const prefix = `${path}/`;
+  let best = null;
+  for (const [candidate, location] of analysis.locations) {
+    if (!candidate.startsWith(prefix)) continue;
+    const from = location.keyStart ?? location.start;
+    if (position < from || position > location.end) continue;
+    const match = candidate.slice(prefix.length).match(/^(nodes|edges|hyperedges)\/([^/]+)$/);
+    if (match && (!best || from >= best.from)) best = { from, kind: match[1] === "nodes" ? "node" : "edge", key: match[2] };
+  }
+  if (!best) return;
+  const id = best.kind === "node" ? best.key.replaceAll("~1", "/").replaceAll("~0", "~") : Number(best.key);
+  if (best.kind === "node" ? !Object.hasOwn(graph.nodes ?? {}, id) : !(graph.edges ?? graph.hyperedges)?.[id]) return;
+  if (selection?.kind === best.kind && selection.id === id) return;
+  selectItem(best.kind, id, { fromSource: true });
 }
 function paintSelection() {
   if (!svg || !active()) return;
@@ -308,7 +478,7 @@ function showInspector() {
     }
     panel.append(list);
   }
-  panel.append(button("Show in source", () => jumpTo(location)));
+  panel.append(button("Show in source", () => selection ? revealInSource(selection.kind, selection.id, true) : jumpTo(location)));
   if (selection?.kind === "node") {
     const links = graph.edges ?? graph.hyperedges ?? [];
     const connected = links.map((edge, index) => ({ edge, index })).filter(({ edge }) => graph.edges
@@ -348,13 +518,18 @@ function search() {
 function applyView() {
   if (!svg || !view) return;
   svg.setAttribute("viewBox", view.join(" "));
-  $("zoom-level").textContent = `${Math.round(baseView[2] / view[2] * 100)}%`;
+  const zoomLevel = baseView[2] / view[2];
+  $("zoom-level").textContent = `${Math.round(zoomLevel * 100)}%`;
+  $("zoom-out").disabled = zoomLevel <= MIN_ZOOM + 1e-6;
+  $("zoom-in").disabled = zoomLevel >= MAX_ZOOM - 1e-6;
 }
 function fit() { if (baseView) { view = [...baseView]; applyView(); } }
 function zoom(factor, point) {
   if (!svg || !view) return;
   const zoomLevel = baseView[2] / view[2];
-  const nextZoom = Math.min(8, Math.max(.15, zoomLevel * factor));
+  const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoomLevel * factor));
+  // The fitted view is the floor: zooming out further only adds empty space.
+  if (nextZoom <= MIN_ZOOM) { fit(); return; }
   const ratio = zoomLevel / nextZoom;
   const center = point ?? { x: view[0] + view[2] / 2, y: view[1] + view[3] / 2 };
   view = [center.x - (center.x - view[0]) * ratio, center.y - (center.y - view[1]) * ratio, view[2] * ratio, view[3] * ratio];
@@ -390,55 +565,213 @@ function attachPanZoom() {
   svg.addEventListener("click", () => { if (!suppressClick) { selection = null; paintSelection(); showInspector(); } });
 }
 function save(content, type, name) {
-  const url = URL.createObjectURL(new Blob([content], { type }));
+  const url = URL.createObjectURL(content instanceof Blob ? content : new Blob([content], { type }));
   const link = element("a");
   link.href = url; link.download = name;
   document.body.append(link); link.click(); link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-function load(text, name) {
+function load(text, name, { baseline = text } = {}) {
   clearTimeout(editTimer);
-  source.value = text;
-  lastLoaded = text;
+  editor.setValue(text);
+  lastLoaded = baseline;
   filename = name;
   current = 0;
   $("filename").textContent = name;
   $("filename").title = name;
-  source.setSelectionRange(0, 0);
-  source.scrollTop = 0;
   update();
+  persist();
+}
+function persist() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ text: editor.value, name: filename, saved: editor.value === lastLoaded })); }
+    catch { /* Storage full or disabled: the session simply is not remembered. */ }
+  }, 400);
+}
+function restore() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    if (typeof stored?.text !== "string" || typeof stored.name !== "string") return false;
+    load(stored.text, stored.name, { baseline: stored.saved ? stored.text : "" });
+    status(`Restored ${stored.name} from your last visit. It is stored only in this browser.`);
+    return true;
+  } catch { return false; }
+}
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify({ layout: $("layout").value, labels: $("labels").checked, details: $("diagnostic-details").checked })); } catch {}
+}
+function restoreSettings() {
+  try {
+    const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY)) ?? {};
+    if ([...$("layout").options].some(option => option.value === settings.layout)) $("layout").value = settings.layout;
+    if (typeof settings.labels === "boolean") $("labels").checked = settings.labels;
+    if (typeof settings.details === "boolean") $("diagnostic-details").checked = settings.details;
+  } catch {}
+}
+function documentEdited() {
+  job++;
+  clearCanvas("Document changed. Updating the preview…");
+  $("viewport").setAttribute("aria-busy", "true");
+  clearTimeout(editTimer);
+  editTimer = setTimeout(update, 350);
+  persist();
+}
+function applyFix(fix) {
+  if (editor.value !== analyzedText) {
+    update();
+    status("The document changed since it was checked. Diagnostics are refreshed; choose the fix again.");
+    return;
+  }
+  // Keep documents that were already 2-space formatted that way after the edit.
+  const wasFormatted = analysis.document !== null && analyzedText === JSON.stringify(analysis.document, null, 2);
+  editor.applyEdits(fix.edits);
+  if (wasFormatted) {
+    const fixed = analyzeSource(editor.value);
+    if (fixed.document !== null && !fixed.diagnostics.some(item => item.code === "duplicate-key")) editor.setValue(JSON.stringify(fixed.document, null, 2), { keepHistory: true });
+  }
+  update();
+  persist();
+  status(`Applied: ${fix.label}. Undo with Ctrl or Command + Z.`);
 }
 function mayReplace() {
-  return source.value === lastLoaded || window.confirm("Replace the current document? Save JSON first if you want to keep your changes.");
+  return editor.value === lastLoaded || window.confirm("Replace the current document? Save JSON first if you want to keep your changes.");
 }
+const MAX_FETCH_MS = 20000;
+// GitHub page links return HTML; the raw host serves the file itself with CORS enabled.
+function rawUrl(url) {
+  const blob = url.hostname === "github.com" && url.pathname.match(/^\/([^/]+)\/([^/]+)\/(?:blob|raw)\/(.+)$/);
+  if (blob) return new URL(`https://raw.githubusercontent.com/${blob[1]}/${blob[2]}/${blob[3]}`);
+  const gist = url.hostname === "gist.github.com" && url.pathname.match(/^\/([^/]+)\/([0-9a-f]+)\/?$/i);
+  if (gist) return new URL(`https://gist.githubusercontent.com/${gist[1]}/${gist[2]}/raw`);
+  return url;
+}
+function urlMessage(text, isError = false) {
+  $("url-message").textContent = text;
+  $("url-message").classList.toggle("error", isError);
+}
+async function readLimited(response) {
+  const declared = Number(response.headers.get("content-length"));
+  if (declared > MAX_SOURCE_BYTES) throw new Error(`The document is ${(declared / 1048576).toFixed(1)} MiB; the limit is 2 MiB.`);
+  if (!response.body) return response.text();
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_SOURCE_BYTES) { reader.cancel(); throw new Error("The document exceeds the 2 MiB limit."); }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(bytes);
+}
+async function loadFromUrl(input, { confirmReplace = true } = {}) {
+  let url;
+  try { url = new URL(input.trim(), location.href); } catch { urlMessage("Enter a complete URL, such as https://example.com/graph.json.", true); return false; }
+  if (url.protocol !== "https:" && url.protocol !== "http:") { urlMessage(`Only http and https URLs can be loaded, not ${url.protocol}`, true); return false; }
+  if (location.protocol === "https:" && url.protocol === "http:" && url.hostname !== "localhost") { urlMessage("This page is served over HTTPS, so the browser blocks plain HTTP downloads (mixed content). Use an https:// URL.", true); return false; }
+  const target = rawUrl(url);
+  if (confirmReplace && !mayReplace()) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MAX_FETCH_MS);
+  $("url-form").setAttribute("aria-busy", "true");
+  $("url-submit").disabled = true;
+  urlMessage(`Fetching ${target.href}${target.href !== url.href ? " (converted to the raw file)" : ""}…`);
+  status(`Fetching ${target.host}…`);
+  try {
+    const response = await fetch(target, { signal: controller.signal, credentials: "omit", redirect: "follow", headers: { Accept: "application/json, text/plain;q=0.9, */*;q=0.5" } });
+    if (!response.ok) throw new Error(`The server answered ${response.status}${response.statusText ? ` ${response.statusText}` : ""}. Check that the URL is correct and publicly readable.`);
+    const type = response.headers.get("content-type") ?? "";
+    if (/text\/html/i.test(type)) throw new Error("The server returned an HTML web page, not JSON. Link to the raw file instead (for GitHub, use the Raw button's URL).");
+    const text = await readLimited(response);
+    const name = decodeURIComponent(target.pathname.split("/").filter(Boolean).pop() || target.hostname) || "remote.json";
+    load(text, name);
+    const share = new URL(location.href);
+    share.search = "";
+    share.searchParams.set("url", url.href);
+    history.replaceState(null, "", share);
+    urlMessage(`Loaded ${plural(text.length, "character")} from ${target.host}. The address bar now links to this document.`);
+    status(`Loaded ${name} from ${target.host}`);
+    $("url-form").hidden = true;
+    $("open-url").setAttribute("aria-expanded", "false");
+    return true;
+  } catch (error) {
+    const message = error.name === "AbortError" ? `No response after ${MAX_FETCH_MS / 1000} seconds. The server may be slow or unreachable.`
+      : error instanceof TypeError ? `The browser could not read ${target.host}. Most often the server does not allow cross-origin requests (CORS), or the host is unreachable. Raw links from GitHub, GitHub Gists, and most static hosts work; otherwise download the file and use Open JSON file.`
+      : error.message;
+    urlMessage(message, true);
+    status(`Could not load the URL: ${message}`);
+    $("url-form").hidden = false;
+    $("open-url").setAttribute("aria-expanded", "true");
+    return false;
+  } finally {
+    clearTimeout(timer);
+    $("url-form").removeAttribute("aria-busy");
+    $("url-submit").disabled = false;
+  }
+}
+function clearSharedUrl() {
+  if (!new URL(location.href).searchParams.has("url")) return;
+  const plain = new URL(location.href);
+  plain.searchParams.delete("url");
+  history.replaceState(null, "", plain);
+}
+$("open-url").addEventListener("click", () => {
+  const open = $("url-form").hidden;
+  $("url-form").hidden = !open;
+  $("open-url").setAttribute("aria-expanded", String(open));
+  if (open) { $("url-input").focus(); $("url-input").select(); }
+});
+$("url-cancel").addEventListener("click", () => { $("url-form").hidden = true; $("open-url").setAttribute("aria-expanded", "false"); $("open-url").focus(); });
+$("url-form").addEventListener("submit", event => { event.preventDefault(); loadFromUrl($("url-input").value); });
+for (const control of document.querySelectorAll("[data-filter]")) control.addEventListener("click", () => { diagnosticFilter = control.dataset.filter; showDiagnostics(); });
+$("diagnostic-details").addEventListener("change", () => $("diagnostics").classList.toggle("compact", !$("diagnostic-details").checked));
+$("expand-diagnostics").addEventListener("click", event => {
+  const expanded = $("source-pane").classList.toggle("diagnostics-expanded");
+  event.currentTarget.setAttribute("aria-pressed", String(expanded));
+  event.currentTarget.textContent = expanded ? "Collapse" : "Expand";
+});
+$("copy-report").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(diagnosticReport()); status("Diagnostics report copied to the clipboard."); }
+  catch { save(diagnosticReport(), "text/plain", filename.replace(/\.json$/i, "") + "-diagnostics.txt"); status("Clipboard unavailable; the report was downloaded instead."); }
+});
 $("open").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", async event => {
   const file = event.target.files[0];
   event.target.value = "";
   if (!file) return;
-  if (file.size > MAX_SOURCE_BYTES) { status("File exceeds the 2 MiB limit. Choose a smaller JSON document."); return; }
   if (!mayReplace()) return;
-  try { load(await file.text(), file.name); } catch (error) { status(`Cannot read file: ${error.message}`); }
+  await openFile(file, true);
 });
-$("example").addEventListener("click", () => { if (mayReplace()) load(JSON.stringify(example, null, 2), "example.json"); });
+async function openFile(file, confirmed = false) {
+  if (file.size > MAX_SOURCE_BYTES) { status("File exceeds the 2 MiB limit. Choose a smaller JSON document."); return; }
+  if (!confirmed && !mayReplace()) return;
+  try { load(await file.text(), file.name); clearSharedUrl(); status(`Opened ${file.name}.`); } catch (error) { status(`Cannot read file: ${error.message}`); }
+}
+$("example").addEventListener("click", () => { if (mayReplace()) { load(JSON.stringify(example, null, 2), "example.json"); clearSharedUrl(); } });
 $("format").addEventListener("click", format);
 function format() {
-  const parsed = analyzeSource(source.value);
+  const parsed = analyzeSource(editor.value);
   if (parsed.diagnostics.some(item => item.code === "duplicate-key") || !parsed.locations.size) {
     update();
     status("Cannot format this document. Resolve syntax errors or duplicate keys first.");
     return;
   }
-  source.value = JSON.stringify(parsed.document, null, 2);
+  editor.setValue(JSON.stringify(parsed.document, null, 2), { keepHistory: true });
   update();
+  persist();
 }
 $("download").addEventListener("click", () => {
-  save(source.value, "application/json", filename);
-  lastLoaded = source.value;
+  save(editor.value, "application/json", filename);
+  lastLoaded = editor.value;
+  persist();
   status("JSON download prepared.");
 });
-$("export").addEventListener("click", () => {
-  if (!svg) return;
+function exportedSvg() {
   const exported = svg.cloneNode(true);
   exported.setAttribute("viewBox", baseView.join(" "));
   exported.setAttribute("width", baseView[2]); exported.setAttribute("height", baseView[3]);
@@ -447,37 +780,87 @@ $("export").addEventListener("click", () => {
     node.removeAttribute("tabindex"); node.removeAttribute("role"); node.removeAttribute("aria-pressed");
     node.classList.remove("selected", "dimmed", "matched");
   }
-  save(new XMLSerializer().serializeToString(exported), "image/svg+xml", filename.replace(/\.json$/i, "") + ".svg");
+  return new XMLSerializer().serializeToString(exported);
+}
+const baseName = () => filename.replace(/\.json$/i, "") || "graph";
+$("export-svg").addEventListener("click", () => {
+  if (!svg) return;
+  save(exportedSvg(), "image/svg+xml", `${baseName()}.svg`);
   status("SVG download prepared.");
+});
+$("export-png").addEventListener("click", async () => {
+  if (!svg) return;
+  const scale = Math.min(2, 16000 / Math.max(baseView[2], baseView[3]));
+  const image = new Image();
+  const url = URL.createObjectURL(new Blob([exportedSvg()], { type: "image/svg+xml" }));
+  try {
+    image.src = url;
+    await image.decode();
+    const canvas = element("canvas");
+    canvas.width = Math.ceil(baseView[2] * scale);
+    canvas.height = Math.ceil(baseView[3] * scale);
+    const context = canvas.getContext("2d");
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
+    if (!blob) throw new Error("the image is too large for this browser");
+    save(blob, "image/png", `${baseName()}.png`);
+    status(`PNG download prepared (${canvas.width} × ${canvas.height}).`);
+  } catch (error) {
+    status(`Cannot create PNG: ${error.message}. Export SVG instead.`);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+});
+$("export-dot").addEventListener("click", () => {
+  if (!active() || hasErrors()) return;
+  save(currentDot(), "text/vnd.graphviz", `${baseName()}.dot`);
+  status("Graphviz DOT download prepared.");
 });
 $("graph-select").addEventListener("change", event => {
   current = Number(event.target.value); selection = null; $("search").value = ""; search(); render();
 });
-$("layout").addEventListener("change", render);
-$("labels").addEventListener("change", render);
+$("layout").addEventListener("change", () => { saveSettings(); render(); });
+$("labels").addEventListener("change", () => { saveSettings(); render(); });
 $("clear-selection").addEventListener("click", () => { selection = null; paintSelection(); showInspector(); });
 $("search").addEventListener("input", search);
 $("zoom-in").addEventListener("click", () => zoom(1.25));
 $("zoom-out").addEventListener("click", () => zoom(.8));
 $("fit").addEventListener("click", fit);
 $("retry-engine").addEventListener("click", startWorker);
-source.addEventListener("scroll", () => { $("line-numbers").scrollTop = source.scrollTop; });
-for (const event of ["click", "keyup", "select"]) source.addEventListener(event, updateCursor);
-source.addEventListener("input", () => {
-  job++;
-  updateLines();
-  clearCanvas("Document changed. Updating the preview…");
-  $("viewport").setAttribute("aria-busy", "true");
-  clearTimeout(editTimer);
-  editTimer = setTimeout(update, 350);
-});
 document.addEventListener("keydown", event => {
+  if (event.defaultPrevented) return;
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); update(); }
   if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "f") { event.preventDefault(); format(); }
   if (event.key === "Escape") { selection = null; paintSelection(); showInspector(); }
 });
-window.addEventListener("beforeunload", event => {
-  if (source.value !== lastLoaded) { event.preventDefault(); event.returnValue = ""; }
+// Drop a JSON file, or a link dragged from another tab, anywhere on the page.
+let dragDepth = 0;
+const dragHasData = event => [...event.dataTransfer.types].some(type => type === "Files" || type === "text/uri-list");
+window.addEventListener("dragenter", event => { if (!dragHasData(event)) return; event.preventDefault(); dragDepth++; $("drop-zone").hidden = false; });
+window.addEventListener("dragover", event => { if (!dragHasData(event)) return; event.preventDefault(); event.dataTransfer.dropEffect = "copy"; });
+window.addEventListener("dragleave", () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) $("drop-zone").hidden = true; });
+window.addEventListener("drop", async event => {
+  if (!dragHasData(event)) return;
+  event.preventDefault();
+  dragDepth = 0;
+  $("drop-zone").hidden = true;
+  const [file] = event.dataTransfer.files;
+  if (file) { await openFile(file); return; }
+  const link = event.dataTransfer.getData("text/uri-list").split("\n").find(line => line && !line.startsWith("#"));
+  if (link) { $("url-input").value = link.trim(); loadFromUrl(link.trim()); }
 });
-load(JSON.stringify(example, null, 2), "example.json");
-startWorker();
+$("diagnostic-details").addEventListener("change", saveSettings);
+
+restoreSettings();
+const sharedUrl = new URL(location.href).searchParams.get("url");
+if (!restore()) load(JSON.stringify(example, null, 2), "example.json");
+// A shared ?url= link still asks before replacing unsaved work restored from this browser.
+if (sharedUrl) { $("url-input").value = sharedUrl; loadFromUrl(sharedUrl); }
+
+const deployed = document.querySelector("#deployed time");
+if (deployed) {
+  deployed.title = deployed.textContent;
+  deployed.textContent = new Date(deployed.dateTime).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}

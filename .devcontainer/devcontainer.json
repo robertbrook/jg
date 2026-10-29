@@ -1,0 +1,10 @@
+{
+  "name": "jg",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:22",
+  "postCreateCommand": "npm ci",
+  "postAttachCommand": "HOST=0.0.0.0 npm run dev",
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": { "label": "jg preview", "onAutoForward": "openPreview" }
+  }
+}

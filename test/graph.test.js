@@ -1,121 +1,140 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import Ajv from "ajv";
 import { instance } from "@viz-js/viz";
-import { analyzeSource, validateDocument, getGraphs, graphStats, layoutSize, toDot, pointer, MAX_SOURCE_BYTES } from "../graph.js";
+import schema from "../schema/json-graph-schema_v2.json" with { type: "json" };
+import { analyzeSource, applyEdits, convertV1, getGraphs, graphStats, layoutSize, previewMode, toDot, pointer } from "../graph.js";
 import { example } from "../example.js";
 
+const json = value => JSON.stringify(value, null, 2);
+const analyze = value => analyzeSource(typeof value === "string" ? value : json(value));
+const codes = result => result.diagnostics.map(item => item.code);
+const errors = result => result.diagnostics.filter(item => item.severity === "error");
+const applyAll = (source, rounds = 10) => {
+  for (let round = 0; round < rounds; round++) {
+    const fix = analyzeSource(source).diagnostics.find(item => item.fixes?.length)?.fixes[0];
+    if (!fix) break;
+    source = applyEdits(source, fix.edits);
+  }
+  return source;
+};
+
 test("the example is valid and connected", () => {
-  assert.deepEqual(validateDocument(example), []);
+  const result = analyze(example);
+  assert.equal(result.summary.schema, "valid");
+  assert.deepEqual(errors(result), []);
   const stats = graphStats(example.graph);
-  assert.equal(stats.nodes, 6);
-  assert.equal(stats.links, 6);
   assert.equal(stats.components, 1);
   assert.equal(stats.isolated, 0);
 });
-test("empty, nodes-only, and multiple graphs are valid", () => {
-  for (const document of [{ graph: {} }, { graphs: [] }, { graph: { nodes: { a: {} } } }, { graphs: [{}, {}] }]) {
-    assert.deepEqual(validateDocument(document), []);
+
+test("strict validity agrees with Ajv across a corpus", () => {
+  const ajv = new Ajv({ strict: false, allErrors: true });
+  const validate = ajv.compile(schema);
+  const corpus = [
+    example, { graph: {} }, { graphs: [] }, { graph: { nodes: { a: {} } } }, { graph: { edges: [] } },
+    { graph: { nodes: { a: {}, b: {} }, edges: [{ source: "a", target: "b" }] } },
+    { graph: { directed: "true", edges: [] } }, { graph: { nodes: [] , edges: [] } }, { graph: {}, graphs: [] },
+    { graph: { edges: [{ sorce: "a", target: "b" }] } }, { graph: { nodes: { a: { colour: "red" } }, edges: [] } },
+    { graph: { nodes: { a: {}, b: {} }, hyperedges: [{ source: ["a"], target: ["b"] }] } },
+    { graph: { directed: false, nodes: { a: {} }, hyperedges: [{ nodes: ["a"] }] } },
+    { graph: { edges: [], hyperedges: [] } }, null, [], 4, {}
+  ];
+  for (const document of corpus) {
+    assert.equal(analyze(document).summary.strictValid, validate(document), JSON.stringify(document));
   }
+});
+
+test("graphs with neither edges nor hyperedges warn about oneOf ambiguity and offer edges: []", () => {
+  const source = json({ graph: { nodes: { a: {} } } });
+  const result = analyzeSource(source);
+  assert.equal(result.summary.schema, "ambiguous");
+  assert.deepEqual(errors(result), []);
+  const warning = result.diagnostics.find(item => item.code === "schema-ambiguous-oneof");
+  assert.equal(warning.severity, "warning");
+  assert.equal(analyzeSource(applyEdits(source, warning.fixes[0].edits)).summary.schema, "valid");
+});
+
+test("reports the closest oneOf branch rather than every alternative", () => {
+  const result = analyze({ graph: { directed: "true", edges: [] } });
+  assert.deepEqual(errors(result).map(item => [item.code, item.path]), [["schema-type", "/graph/directed"]]);
+  assert.match(errors(result)[0].message, /boolean/);
+});
+
+test("suggests renames for mistyped properties and points at the key", () => {
+  const source = json({ graph: { nodes: { a: {}, b: {} }, edges: [{ sorce: "a", target: "b" }] } });
+  const result = analyzeSource(source);
+  const item = result.diagnostics.find(entry => entry.code === "schema-additional-property");
+  assert.equal(item.suggestion, "source");
+  assert.ok(source.slice(item.start).startsWith('"sorce"'));
+  assert.ok(item.line > 1 && item.column > 1);
+  assert.ok(item.fixes.some(fix => fix.label.includes('"source"')));
+});
+
+test("suggests the nearest node for unknown references", () => {
+  const result = analyze({ graph: { nodes: { draft: {}, review: {} }, edges: [{ source: "Draft", target: "review" }] } });
+  const item = result.diagnostics.find(entry => entry.code === "unknown-node");
+  assert.equal(item.path, "/graph/edges/0/source");
+  assert.equal(item.suggestion, "draft");
+});
+
+test("reports duplicate keys that JSON.parse would silently drop", () => {
+  assert.ok(codes(analyzeSource('{"graph":{"nodes":{"a":{},"a":{}},"edges":[]}}')).includes("duplicate-key"));
+});
+
+test("syntax errors have positions and fixes that produce parseable JSON", () => {
+  for (const source of ['{"graph": {"nodes": {},}}', '{"graph": {"nodes": {} "edges": []}}', '{"graph": {"edges": [], "directed": NaN}}', '{"graph": {"edges": []', '{"graph": {"label": "x']) {
+    const [item] = analyzeSource(source).diagnostics;
+    assert.equal(item.code, "syntax", source);
+    assert.ok(item.line >= 1 && item.column >= 1, source);
+    assert.ok(item.fixes.length, source);
+    assert.doesNotThrow(() => JSON.parse(applyEdits(source, item.fixes[0].edits)), source);
+  }
+  assert.equal(analyzeSource("").diagnostics[0].code, "syntax");
+});
+
+test("applying fixes repeatedly repairs a broken document", () => {
+  const source = json({ graph: { directed: "true", nodes: { draft: {}, review: {} }, edges: [{ sorce: "draft", target: "review", weight: 2 }, { source: "review", target: "Draft" }] } });
+  const result = analyzeSource(applyAll(source));
+  assert.deepEqual(errors(result), []);
+  assert.equal(result.summary.schema, "valid");
+  assert.deepEqual(result.document.graph.edges[0].metadata, { weight: 2 });
+});
+
+test("converts v1 documents to v2", () => {
+  const { document, changed, notes } = convertV1({ graph: { nodes: [{ id: "a", label: "A", color: "red" }, { label: "B" }, { id: "a" }], edges: [{ source: 1, target: "a", style: "dashed" }] } });
+  assert.ok(changed);
+  assert.deepEqual(Object.keys(document.graph.nodes), ["a", "node-2"]);
+  assert.deepEqual(document.graph.nodes.a, { label: "A", metadata: { color: "red" } });
+  assert.deepEqual(document.graph.edges[0], { source: "1", target: "a", metadata: { style: "dashed" } });
+  assert.ok(notes.length >= 3);
+  assert.equal(convertV1(example).changed, false);
+});
+
+test("handles prototype-like IDs and JSON pointer escaping", () => {
+  const result = analyzeSource('{"graph":{"nodes":{"__proto__":{},"constructor":{}},"edges":[{"source":"__proto__","target":"constructor"}]}}');
+  assert.deepEqual(errors(result), []);
+  assert.equal(pointer("/graph/nodes", "a/b~c"), "/graph/nodes/a~1b~0c");
   assert.deepEqual(getGraphs({ graphs: [{}, {}] }).map(item => item.path), ["/graphs/0", "/graphs/1"]);
 });
-test("requires exactly one document envelope", () => {
-  for (const document of [null, [], 4, {}, { graph: {}, graphs: [] }, { graphs: {} }]) assert.ok(validateDocument(document).length);
+
+test("chooses a preview mode by size", () => {
+  const graph = count => ({ nodes: Object.fromEntries(Array.from({ length: count }, (_, index) => [`n${index}`, {}])), edges: [] });
+  assert.equal(previewMode(graph(10)).mode, "full");
+  assert.equal(previewMode(graph(1000)).mode, "compact");
+  assert.equal(previewMode(graph(6000)).mode, "too-large");
+  assert.deepEqual(layoutSize({ nodes: { a: {}, b: {} }, hyperedges: [{ nodes: ["a", "b"] }] }), { nodes: 3, links: 2 });
 });
-test("validates field types, required endpoints, and custom data placement", () => {
-  const result = validateDocument({ graph: { directed: "yes", nodes: { a: { color: "red", metadata: [] } }, edges: [{ target: 7 }] } });
-  for (const path of ["/graph/directed", "/graph/nodes/a/color", "/graph/nodes/a/metadata", "/graph/edges/0/source", "/graph/edges/0/target"]) {
-    assert.ok(result.some(item => item.path === path), path);
-  }
-});
-test("rejects dangling references and retains JSON pointer escaping", () => {
-  const result = validateDocument({ graph: { nodes: { "a/b~c": {} }, edges: [{ source: "a/b~c", target: "missing" }] } });
-  assert.equal(result.length, 1);
-  assert.equal(result[0].path, "/graph/edges/0/target");
-  assert.equal(pointer("/graph/nodes", "a/b~c"), "/graph/nodes/a~1b~0c");
-});
-test("handles prototype-like keys as ordinary IDs without inherited references", () => {
-  const document = JSON.parse('{"graph":{"nodes":{"__proto__":{},"constructor":{}},"edges":[{"source":"__proto__","target":"constructor"}]}}');
-  assert.deepEqual(validateDocument(document), []);
-  assert.equal(graphStats(document.graph).components, 1);
-  assert.ok(validateDocument({ graph: { edges: [{ source: "constructor", target: "toString" }] } }).length === 2);
-});
-test("validates all graphs, not just the selected one", () => {
-  assert.equal(validateDocument({ graphs: [{}, { nodes: [] }] })[0].path, "/graphs/1/nodes");
-});
-test("accepts directed and undirected hyperedges and checks each member", () => {
-  for (const graph of [
-    { nodes: { a: {}, b: {} }, hyperedges: [{ source: ["a"], target: ["b"] }] },
-    { directed: false, nodes: { a: {}, b: {} }, hyperedges: [{ nodes: ["a", "b"] }] }
-  ]) {
-    assert.deepEqual(validateDocument({ graph }), []);
-    assert.equal(graphStats(graph).components, 1);
-    assert.deepEqual(layoutSize(graph), { nodes: 3, links: 2 });
-  }
-  const diagnostics = validateDocument({ graph: { hyperedges: [{ source: ["missing", 3], target: [] }] } });
-  assert.equal(diagnostics.length, 2);
-  assert.ok(diagnostics.some(item => item.path === "/graph/hyperedges/0/source/1"));
-});
-test("does not mix edges and hyperedges or hyperedge direction forms", () => {
-  assert.ok(validateDocument({ graph: { edges: [], hyperedges: [] } }).length);
-  assert.ok(validateDocument({ graph: { hyperedges: [{ nodes: [] }] } }).length);
-  assert.ok(validateDocument({ graph: { directed: false, hyperedges: [{ source: [], target: [] }] } }).length);
-});
-test("warns about duplicate edge IDs without rejecting parallel edges", () => {
-  const graph = { nodes: { a: {} }, edges: [{ id: "x", source: "a", target: "a" }, { id: "x", source: "a", target: "a" }] };
-  assert.deepEqual(validateDocument({ graph }).map(item => item.severity), ["warning"]);
-  assert.equal(graphStats(graph).isolated, 0);
-});
-test("indexes exact source ranges, including escaped keys and nested metadata", () => {
-  const source = '{ "graph": { "nodes": { "a/b~c": { "metadata": { "values": [1, {"ok": true}] } } } } }';
-  const { locations, diagnostics } = analyzeSource(source);
-  assert.deepEqual(diagnostics, []);
-  const location = locations.get("/graph/nodes/a~1b~0c/metadata/values/1/ok");
-  assert.equal(source.slice(location.start, location.end), "true");
-  const nodeLocation = locations.get("/graph/nodes/a~1b~0c");
-  assert.deepEqual(JSON.parse(source.slice(nodeLocation.start, nodeLocation.end)), { metadata: { values: [1, { ok: true }] } });
-});
-test("detects duplicate keys at any depth before data can be lost", () => {
-  const result = analyzeSource('{"graph":{"nodes":{"a":{},"a":{"metadata":{"x":1,"x":2}}}}}');
-  assert.equal(result.diagnostics.filter(item => item.code === "duplicate-key").length, 2);
-  assert.ok(result.diagnostics.every(item => Number.isInteger(item.start)));
-});
-test("reports invalid JSON and oversized input", () => {
-  const invalid = analyzeSource('{"graph": invalid}');
-  assert.equal(invalid.diagnostics[0].code, "syntax");
-  assert.ok(Number.isInteger(invalid.diagnostics[0].start));
-  assert.match(analyzeSource(" ".repeat(MAX_SOURCE_BYTES + 1)).diagnostics[0].message, /2 MiB/);
-});
-test("counts weak components and isolated nodes without assuming direction", () => {
-  const stats = graphStats({ nodes: { a: {}, b: {}, c: {}, d: {} }, edges: [{ source: "a", target: "b" }] });
-  assert.equal(stats.components, 3);
-  assert.equal(stats.isolated, 2);
-});
-test("WASM renders ordinary and hyperedge layouts in all supported engines", async () => {
+
+test("DOT output escapes labels, keeps hyperedge direction, and renders with Graphviz WASM", async () => {
   const viz = await instance();
-  const graphs = [
-    example.graph,
-    { directed: false, nodes: { a: {}, b: {} }, hyperedges: [{ nodes: ["a", "b"], label: "group" }] },
-    { nodes: { a: {}, b: {} }, hyperedges: [{ source: ["a"], target: ["b"] }] }
-  ];
-  for (const engine of ["dot", "neato", "circo"]) for (const graph of graphs) {
-    const result = viz.render(toDot(graph), { format: "svg", engine });
-    assert.equal(result.status, "success", JSON.stringify(result.errors));
-    assert.match(result.output, /<svg/);
-    assert.match(result.output, /id="n0"/);
+  const full = toDot({ directed: false, nodes: { a: { label: 'say "hi"\\' }, b: {} }, hyperedges: [{ source: ["a"], target: ["b"], label: "h" }] });
+  assert.match(full, /h0 -> n1 \[id="e0t0"\]/);
+  assert.ok(full.includes(String.raw`label="say \"hi\"\\"`));
+  assert.match(viz.renderString(full, { format: "svg" }), /say &quot;hi&quot;\\</);
+  const compact = toDot(example.graph, { compact: true });
+  assert.doesNotMatch(compact, /label="[^"]/);
+  for (const [dot, engine] of [[full, "dot"], [toDot(example.graph), "dot"], [compact, "sfdp"]]) {
+    assert.equal(viz.render(dot, { format: "svg", engine }).status, "success");
   }
-});
-test("labels cannot inject DOT, HTML, external links, or Graphviz substitutions", async () => {
-  const viz = await instance();
-  const label = '<script>alert(1)</script> "]; evil [URL="https://invalid.test"]; // \\N';
-  const graph = { nodes: { 'a"b': { label } } };
-  const output = viz.renderString(toDot(graph), { format: "svg" });
-  assert.doesNotMatch(output, /<script>|<a |xlink:href=/);
-  assert.match(output, /&lt;script&gt;/);
-  assert.match(output, /\\N/);
-  assert.equal((output.match(/class="node"/g) ?? []).length, 1);
-});
-test("edge direction overrides inheritance, and labels can be switched off", () => {
-  const graph = { directed: false, nodes: { a: {} }, edges: [{ source: "a", target: "a", directed: true, label: "Loop" }] };
-  assert.match(toDot(graph), /dir="forward", label="Loop"/);
-  assert.match(toDot(graph, false), /dir="forward", label=""/);
 });

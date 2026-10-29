@@ -36,3 +36,17 @@ https://github.com/libexpat/libexpat
 
 Viz.js build recipes and dependency versions:
 https://github.com/mdaines/viz-js/tree/v3.31.0
+
+----------------------------------------------------------------------
+
+JSON Graph Format schema (schema/json-graph-schema_v2.json)
+https://github.com/jsongraph/json-graph-specification
+Copyright (c) the JSON Graph Format authors. Distributed under the MIT-style
+licence in that repository; the schema is included unmodified.
+
+----------------------------------------------------------------------
+
+CodeMirror 6 and Lezer (bundled into vendor/editor.js)
+https://codemirror.net/  https://lezer.codemirror.net/
+MIT License. Copyright (C) 2018-2021 by Marijn Haverbeke <marijn@haverbeke.berlin> and others.
+The MIT License text above applies.
