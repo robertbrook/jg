@@ -10,9 +10,8 @@
 </head>
 <body>
   <header class="app-header">
-    <div class="identity"><span class="mark" aria-hidden="true">jg</span><div><h1>JSON Graph workbench</h1><p>Preview the structure. Find the fault.</p></div></div>
+    <h1>JSON Graph workbench</h1>
     <div class="file-actions">
-      <span class="local-note"><span class="local-dot"></span> Local to your browser</span>
       <button id="example" type="button">Load example</button>
       <button id="open-url" type="button" aria-expanded="false" aria-controls="url-form">Load from URL</button>
       <button id="open" class="primary" type="button">Open JSON file</button>
@@ -61,18 +60,21 @@
         <select id="layout" title="Layout engine"><option value="dot">Hierarchical</option><option value="neato">Force-directed</option><option value="circo">Circular</option></select>
         <label class="checkbox"><input id="labels" type="checkbox" checked> Edge labels</label>
       </div>
-      <div class="graph-summary" id="graph-summary">Reading document…</div>
-      <div id="viewport" class="viewport" aria-busy="true">
-        <div id="canvas"></div>
-        <div id="preview-message" class="preview-message" role="status">Preparing the layout engine…</div>
-        <div class="canvas-controls" aria-label="Graph view controls">
+      <div class="preview-toolbar view-toolbar">
+        <span class="zoom-group" role="group" aria-label="Graph view controls">
           <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
           <output id="zoom-level" aria-label="Zoom level">100%</output>
           <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
           <button id="fit" type="button">Fit</button>
-        </div>
+        </span>
+        <button id="retry-engine" type="button" hidden>Retry engine</button>
+        <span class="export-group" role="group" aria-label="Export"><span class="export-label">Export</span><button id="export-svg" type="button" disabled>SVG</button><button id="export-png" type="button" disabled>PNG</button><button id="export-dot" type="button" disabled title="Graphviz DOT source">DOT</button></span>
       </div>
-      <div class="preview-footer"><span>Drag to pan · Scroll to zoom · Double-click to edit</span><button id="retry-engine" type="button" hidden>Retry engine</button><span class="export-group" role="group" aria-label="Export"><button id="export-svg" type="button" disabled>SVG</button><button id="export-png" type="button" disabled>PNG</button><button id="export-dot" type="button" disabled title="Graphviz DOT source">DOT</button></span></div>
+      <div class="graph-summary"><span id="graph-summary">Reading document…</span><span class="view-hint">Drag to pan · Scroll to zoom · Double-click to edit</span></div>
+      <div id="viewport" class="viewport" aria-busy="true">
+        <div id="canvas"></div>
+        <div id="preview-message" class="preview-message" role="status">Preparing the layout engine…</div>
+      </div>
     </section>
 
     <aside class="inspector-pane" aria-labelledby="inspector-heading">
