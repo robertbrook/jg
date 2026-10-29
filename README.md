@@ -36,6 +36,8 @@ The page footer shows when the site was built or last deployed, linking to the s
 - **Linked selection:** selecting a node or edge highlights its source; moving the cursor in the source selects it in the diagram. Double-click a diagram item to edit it.
 - **Loading:** paste, open a file, drag and drop a file or link, or load from a URL (GitHub and Gist links are converted to raw URLs; the server must allow CORS). `?url=` links are shareable.
 - **Export:** SVG, PNG, and Graphviz DOT.
+- **Examples:** the example menu includes directed and undirected graphs, self-loops and parallel edges, multiple graphs, directed and undirected hyperedges, and a large 800-node graph. Debugging practice documents have schema errors, a JSON syntax error, or use JSON Graph v1.
+- **Panes:** on desktop, hide the Document, Graph preview, or Inspector pane; a narrow tab brings it back. The choice is remembered.
 - Automatic light and dark themes that follow your system setting.
 
 Shortcuts: **Ctrl/Command + Enter** checks immediately; **Ctrl/Command + Shift + F** formats JSON; **Escape** clears the selection.
