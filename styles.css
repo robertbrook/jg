@@ -123,8 +123,6 @@ input[type="search"] { width: 100%; }
 .inspector h4 { margin: 14px 0 6px; }
 .inspector pre { max-height: 300px; overflow: auto; padding: 8px; background: var(--soft); white-space: pre-wrap; overflow-wrap: anywhere; }
 .inspector-help { padding: 12px; border-top: 1px solid var(--rule); }
-.inspector-help h3 { font-size: 1rem; margin-bottom: 4px; }
-.inspector-help p { color: var(--muted); }
 .app-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; color: var(--muted); font-size: .85em; }
 
 /* Graph highlights. Graphviz writes light colors into the SVG; dark mode recolors on screen only, so exports stay printable. */
